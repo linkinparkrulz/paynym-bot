@@ -6,6 +6,7 @@
 import { HDKey } from '@scure/bip32'
 import {
   MAINNET,
+  TESTNET,
   encodePaymentCode,
   decodePaymentCode,
   p2pkhAddress,
@@ -73,6 +74,31 @@ for (let i = 0; i < BOB_RECEIVE.length; i++) {
 for (let i = 0; i < BOB_RECEIVE.length; i++) {
   check(`alice send[${i}] == bob receive[${i}]`, sendAddress(aliceAccount, BOB_PC, i), BOB_RECEIVE[i])
 }
+
+// 6. Testnet. A payment code carries no network information, so the derivation
+//    itself must be network-independent; the network may only reach the final
+//    address encoding. Regression for a synthetic-xpub version byte that made
+//    every testnet derivation throw 'Version mismatch', leaving the README's own
+//    "testnet first" instruction unrunnable.
+const aliceTestnet = HDKey.fromMasterSeed(fromHex(ALICE_SEED)).derive("m/47'/1'/0'")
+const bobTestnet = HDKey.fromMasterSeed(fromHex(BOB_SEED)).derive("m/47'/1'/0'")
+const aliceTestnetPC = encodePaymentCode(aliceTestnet.publicKey!, aliceTestnet.chainCode!)
+const bobTestnetPC = encodePaymentCode(bobTestnet.publicKey!, bobTestnet.chainCode!)
+
+for (let i = 0; i < 10; i++) {
+  const recv = receiveAddress(bobTestnet, aliceTestnetPC, i, TESTNET)
+  check(`testnet alice send[${i}] == bob receive[${i}]`, sendAddress(aliceTestnet, bobTestnetPC, i, TESTNET), recv)
+  check(`testnet receive[${i}] encodes as testnet`, recv[0] === 'm' || recv[0] === 'n', true)
+}
+
+// The network must still reach the address encoding: same keys, different net,
+// different address. Guards against "fixing" testnet by ignoring the network.
+check(
+  'testnet and mainnet addresses differ',
+  receiveAddress(bobTestnet, aliceTestnetPC, 0, TESTNET) !==
+    receiveAddress(bobTestnet, aliceTestnetPC, 0, MAINNET),
+  true,
+)
 
 console.log('')
 if (failures === 0) {

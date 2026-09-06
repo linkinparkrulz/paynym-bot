@@ -1,21 +1,30 @@
-// Regression tests for the two §4 defects (implementation handoff).
+// Regression tests for defects that a one-shot test cannot see, but that become
+// certain failures once the receiver runs continuously.
 //
-// A2 (§4.1): two senders register back-to-back against one online receiver with
-//   NO intervening publish tick. Both must succeed — the first sender's read of
-//   the rendezvous key must not consume it. Fails against the pre-fix code,
-//   which used waitAndRemove on a deliberately long-lived broadcast entry.
+// A2: two senders register back-to-back against one online receiver with NO
+//   intervening publish tick. Both must succeed — the first sender's read of the
+//   rendezvous key must not consume it. Fails against code that used
+//   waitAndRemove on a deliberately long-lived broadcast entry.
 //
-// A3 (§4.2): a crash between accepting a registration and removing its inbox
-//   entry must lose nothing. We inject a throw inside `onAccepted`; the entry
-//   must survive in the inbox, and a "restart" (fresh Registrar + Registry from
-//   the same state) must re-ingest it and finally remove it.
+// A3: a crash between accepting a registration and removing its inbox entry
+//   must lose nothing. We inject a throw inside `onAccepted`; the entry must
+//   survive in the inbox, and a "restart" (fresh Registrar + Registry from the
+//   same state) must re-ingest it and finally remove it.
 //
-// Plus: the persisted box-key case from §10.2 — a sender that fetched the
-//   rendezvous key, then restarts the daemon with the SAME box keypair, must
-//   still be able to decrypt when the envelope is finally posted.
+// Persisted box key: a sender that fetched the rendezvous key, then restarts the
+//   daemon with the SAME box keypair, must still decrypt when the envelope is
+//   finally posted.
+//
+// Test-double fidelity: the in-memory node must model Remove faithfully, or the
+//   assertions above pass without demonstrating anything.
+//
+// Testnet: payment-code derivation must be network-independent, or every
+//   testnet registration is silently rejected.
 
 import { PaynymIdentity } from '../src/identity.ts'
+import { TESTNET } from '../src/bip47.ts'
 import { SorobanRPC, BoxKeypair } from '../src/soroban.ts'
+import { watchWindow } from '../src/watcher.ts'
 import {
   Registrar,
   Registry,
@@ -24,7 +33,7 @@ import {
   rendezvousName,
   inboxName,
 } from '../src/register.ts'
-import { memoryNode } from './memory-node.ts'
+import { memoryNode, MODE_TTL_MS } from './memory-node.ts'
 
 const fromHex = (h: string) => Uint8Array.from(Buffer.from(h, 'hex'))
 
@@ -139,11 +148,80 @@ await (async () => {
     const added = await restarted.poll(rpc)
     assert('persisted box key decrypts in-flight registration', added.length === 1 && added[0] === alice.paymentCode())
   }
+
+  // --- Test-double fidelity: Remove must not expire the survivors ----------
+  // The in-memory node rebuilt the directory with expireOn: 0, so ANY Remove
+  // emptied it -- including one naming an entry that was never there. Every
+  // multi-entry assertion in this file is only meaningful while this holds.
+  {
+    const node = memoryNode()
+    const rpc = new SorobanRPC(node.transport)
+    await rpc.add('d', 'A', 'long')
+    await rpc.add('d', 'B', 'long')
+    await rpc.add('d', 'C', 'long')
+    await rpc.remove('d', 'A')
+    assert('node: removing one entry leaves the others live', node.live('d').join(',') === 'B,C')
+    await rpc.remove('d', 'never-added')
+    assert('node: removing an absent entry changes nothing', node.live('d').join(',') === 'B,C')
+    node.advance(MODE_TTL_MS.long + 1)
+    assert('node: survivors still expire on schedule', node.live('d').length === 0)
+  }
+
+  // --- Multi-entry inbox drain, including a malformed entry ----------------
+  // A bad entry must never pin the queue, and the good ones around it must
+  // still be accepted and cleared in the same pass.
+  {
+    const node = memoryNode()
+    const rpc = new SorobanRPC(node.transport)
+    const bob = PaynymIdentity.fromSeed(BOB_SEED)
+    const registrar = new Registrar(bob, BoxKeypair.generate(), new Registry())
+    const inbox = inboxName(bob.paymentCode())
+    await registrar.publishRendezvous(rpc)
+    for (const seed of [ALICE_SEED, CAROL_SEED]) {
+      await registerWithReceiver(rpc, PaynymIdentity.fromSeed(seed), bob.paymentCode())
+    }
+    await rpc.add(inbox, 'garbage-not-a-sealed-envelope', 'long')
+    const added = await registrar.poll(rpc)
+    assert('drain: both valid registrations accepted', added.length === 2)
+    assert('drain: malformed entry counted as rejected', registrar.rejected() === 1)
+    assert('drain: inbox fully emptied', node.live(inbox).length === 0)
+  }
+
+  // --- Testnet registration and derivation, end to end ---------------------
+  // Registration was never network-dependent: identityKeyOf derives through
+  // nodeFromPaymentCode without passing a network, so it defaulted to mainnet
+  // and verified fine. Address derivation DID thread the network, and threw
+  // 'Version mismatch'. So a testnet receiver accepted senders happily and then
+  // died at the first watch-window build -- a late failure, at the point of
+  // use, which is why a registration-only test would not have caught it.
+  {
+    const node = memoryNode()
+    const rpc = new SorobanRPC(node.transport)
+    const bob = PaynymIdentity.fromSeed(BOB_SEED, TESTNET)
+    const alice = PaynymIdentity.fromSeed(ALICE_SEED, TESTNET)
+    const registrar = new Registrar(bob, BoxKeypair.generate(), new Registry())
+    await registrar.publishRendezvous(rpc)
+    await registerWithReceiver(rpc, alice, bob.paymentCode())
+    const added = await registrar.poll(rpc)
+    assert('testnet: registration accepted end to end', added.length === 1 && added[0] === alice.paymentCode())
+    assert('testnet: nothing rejected', registrar.rejected() === 0)
+
+    const window = watchWindow(bob, registrar.registry)
+    assert('testnet: watch window is non-empty', window.length > 0)
+    assert(
+      'testnet: every watch address encodes as testnet',
+      window.every((w) => w.address[0] === 'm' || w.address[0] === 'n'),
+    )
+    assert(
+      'testnet: sender agrees on every watch address',
+      window.every((w) => alice.sendAddress(bob.paymentCode(), w.index) === w.address),
+    )
+  }
 })()
 
 console.log('')
 if (failures === 0) {
-  console.log('PASS — §4 regression tests (A2, A3, persisted box key).')
+  console.log('PASS — durability, test-double fidelity, and testnet regressions.')
 } else {
   console.log(`FAIL — ${failures} regression check(s) failed.`)
   process.exit(1)

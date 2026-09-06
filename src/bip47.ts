@@ -25,14 +25,12 @@ const CURVE_N = secp256k1.CURVE.n
 export type Network = {
   // P2PKH version byte: 0x00 mainnet, 0x6f testnet.
   p2pkhVersion: number
-  // BIP32 xpub version: 0x0488b21e mainnet, 0x043587cf testnet.
-  xpubVersion: number
   // SLIP-44 coin type for the m/47'/coin'/account' path (0 mainnet, 1 testnet).
   coinType: number
 }
 
-export const MAINNET: Network = { p2pkhVersion: 0x00, xpubVersion: 0x0488b21e, coinType: 0 }
-export const TESTNET: Network = { p2pkhVersion: 0x6f, xpubVersion: 0x043587cf, coinType: 1 }
+export const MAINNET: Network = { p2pkhVersion: 0x00, coinType: 0 }
+export const TESTNET: Network = { p2pkhVersion: 0x6f, coinType: 1 }
 
 const PAYMENT_CODE_VERSION = 0x01
 const PAYMENT_CODE_PREFIX = 0x47 // makes the base58 string start with "PM8T..."
@@ -89,16 +87,28 @@ export function decodePaymentCode(paymentCode: string): PaymentCodeParts {
   return { pubkey: body.slice(2, 35), chainCode: body.slice(35, 67) }
 }
 
+// Version bytes for the synthetic extended key below. This is an internal
+// detail of the CKDpub vehicle, NOT a network parameter: the synthetic xpub
+// never leaves this function, is never serialised, and CKDpub yields identical
+// child pubkeys whatever version is stamped on it. Threading a network in here
+// only created the chance to stamp a version @scure/bip32 then rejects, which
+// is what made every testnet derivation throw 'Version mismatch'.
+const VEHICLE_XPUB_VERSION = 0x0488b21e
+
 /**
  * Build a watch-only HD node from a payment code so we can CKDpub into its
  * account children (B_i / A_i). We reuse @scure/bip32's audited CKDpub by
  * synthesising the xpub the account pubkey+chaincode represent.
+ *
+ * Network-independent by construction: a payment code carries no network
+ * information, and the network only matters when encoding a final address
+ * (see p2pkhAddress).
  */
-export function nodeFromPaymentCode(paymentCode: string, network: Network = MAINNET): HDKey {
+export function nodeFromPaymentCode(paymentCode: string): HDKey {
   const { pubkey, chainCode } = decodePaymentCode(paymentCode)
   const data = new Uint8Array(78)
   const dv = new DataView(data.buffer)
-  dv.setUint32(0, network.xpubVersion)
+  dv.setUint32(0, VEHICLE_XPUB_VERSION)
   data[4] = 3 // depth of m/47'/coin'/account'
   // parent fingerprint (5..9) and child number (9..13) intentionally zero
   data.set(chainCode, 13)
@@ -132,7 +142,7 @@ export function receiveAddress(
   index: number,
   network: Network = MAINNET,
 ): string {
-  const senderNode = nodeFromPaymentCode(senderPaymentCode, network)
+  const senderNode = nodeFromPaymentCode(senderPaymentCode)
   const A0 = Point.fromHex(senderNode.deriveChild(0).publicKey!)
   const ourChild = ourAccount.deriveChild(index)
   const bI = BigInt('0x' + toHex(ourChild.privateKey!))
@@ -152,7 +162,7 @@ export function receivePrivateKey(
   index: number,
   network: Network = MAINNET,
 ): string {
-  const senderNode = nodeFromPaymentCode(senderPaymentCode, network)
+  const senderNode = nodeFromPaymentCode(senderPaymentCode)
   const A0 = Point.fromHex(senderNode.deriveChild(0).publicKey!)
   const ourChild = ourAccount.deriveChild(index)
   const bI = BigInt('0x' + toHex(ourChild.privateKey!))
@@ -176,7 +186,7 @@ export function sendAddress(
   index: number,
   network: Network = MAINNET,
 ): string {
-  const receiverNode = nodeFromPaymentCode(receiverPaymentCode, network)
+  const receiverNode = nodeFromPaymentCode(receiverPaymentCode)
   const a0 = BigInt('0x' + toHex(ourAccount.deriveChild(0).privateKey!))
   const BI = Point.fromHex(receiverNode.deriveChild(index).publicKey!)
   const s = sharedSecretScalar(BI.multiply(a0))

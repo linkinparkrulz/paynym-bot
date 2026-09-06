@@ -1,7 +1,7 @@
 // In-memory Soroban node for offline tests.
 //
-// Q7 (§13 of the handoff paper): the node models the real server's semantics
-// closely enough to exercise the daemon:
+// The node models the real server's semantics closely enough to exercise a
+// continuously-running receiver:
 //   * directory.Add of an identical (Name, Entry) REFRESHES the TTL rather than
 //     appending a duplicate — mirrors soroban internal/memory/memory.go.
 //   * Entries expire after the mode TTL, so scheduler tests can observe a
@@ -45,9 +45,17 @@ export class MemoryNode {
         return { result: { Name: a.Name, Entries: this.live(a.Name) } }
       }
       if (method === 'directory.Remove') {
-        const list = this.live(a.Name)
-        const next = list.filter((e) => e !== a.Entry)
-        this.dirs.set(a.Name, next.map((e) => ({ value: e, expireOn: 0 })))
+        // Filter the raw entries and PRESERVE each survivor's expiry. Mapping
+        // live values back through a fresh { expireOn: 0 } marked every other
+        // entry expired, so ANY Remove emptied the whole directory — even one
+        // naming an entry that was never there. That made multi-entry drains
+        // untestable and let the durability regressions in register-fixes.test.ts
+        // pass vacuously.
+        const list = this.dirs.get(a.Name) ?? []
+        this.dirs.set(
+          a.Name,
+          list.filter((e) => e.expireOn > this.nowMs && e.value !== a.Entry),
+        )
         return { result: { Status: 'success' } }
       }
       return { result: null }
