@@ -42,8 +42,11 @@ export function encodeDirectory(name: string): string {
  */
 export type RpcTransport = (payload: unknown) => Promise<any>
 
-export function fetchTransport(url: string): RpcTransport {
+export function fetchTransport(url: string, timeoutMs = 15_000): RpcTransport {
   return async (payload: unknown) => {
+    // Without a deadline a stalled node wedges the caller forever. The daemon
+    // skips a tick whose predecessor is still running, so one hung request
+    // would silently stop that job for the life of the process.
     const res = await fetch(url, {
       method: 'POST',
       headers: {
@@ -52,6 +55,7 @@ export function fetchTransport(url: string): RpcTransport {
         'user-agent': 'HotJava/1.1.2 FCS',
       },
       body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(timeoutMs),
     })
     if (!res.ok) throw new Error(`Soroban RPC HTTP ${res.status}`)
     return res.json()

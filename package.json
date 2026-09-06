@@ -9,13 +9,14 @@
     "vectors": "node --experimental-strip-types --no-warnings test/vectors.test.ts",
     "protocol": "node --experimental-strip-types --no-warnings test/protocol.test.ts",
     "regress": "node --experimental-strip-types --no-warnings test/register-fixes.test.ts",
-    "test": "npm run vectors && npm run protocol && npm run regress && npm run state && npm run seed && npm run server && npm run electrum && npm run daemon",
+    "test": "npm run vectors && npm run protocol && npm run regress && npm run state && npm run seed && npm run server && npm run electrum && npm run discover && npm run daemon",
     "state": "node --experimental-strip-types --no-warnings test/state.test.ts",
     "server": "node --experimental-strip-types --no-warnings test/server.test.ts",
     "electrum": "node --experimental-strip-types --no-warnings test/electrum.test.ts",
     "daemon": "node --experimental-strip-types --no-warnings test/daemon.test.ts",
     "seed": "node --experimental-strip-types --no-warnings test/seed.test.ts",
-    "typecheck": "tsc --noEmit --strict --module nodenext --target es2022 --allowImportingTsExtensions src/*.ts test/*.ts bin/*.ts example.ts"
+    "typecheck": "tsc --noEmit --strict --module nodenext --target es2022 --allowImportingTsExtensions src/*.ts test/*.ts bin/*.ts example.ts",
+    "discover": "node --experimental-strip-types --no-warnings test/discover.test.ts"
   },
   "dependencies": {
     "@noble/curves": "^1.7.0",

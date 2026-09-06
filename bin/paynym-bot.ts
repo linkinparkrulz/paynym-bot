@@ -6,6 +6,7 @@
 //   paynym-bot status [--data <dir>]
 //   paynym-bot serve [--data <dir>]          storefront only
 //   paynym-bot start [--data <dir>]          storefront + listen + scan
+//   paynym-bot doctor                        find the Dojo services, or say why not
 //
 // init is the guided setup: it asks which network to run on, generates the
 // seed, and writes the state file. That network choice is permanent — see the
@@ -20,6 +21,15 @@ import { watchWindow } from '../src/watcher.ts'
 import { SorobanRPC } from '../src/soroban.ts'
 import { ElectrumClient, electrumUsedChecker } from '../src/electrum.ts'
 import { Daemon } from '../src/daemon.ts'
+import {
+  FULCRUM_PORT,
+  SOROBAN_PORT,
+  candidatesFor,
+  probeElectrum,
+  probeSoroban,
+  remedyFor,
+  sorobanUrlFor,
+} from '../src/discover.ts'
 import {
   isValidMnemonic,
   newMnemonic,
@@ -321,14 +331,55 @@ function start(): void {
   process.on('SIGTERM', shutdown)
 }
 
+/**
+ * Diagnose the connection to the local Dojo. The installer runs the same probes;
+ * having it as a command means an operator can re-run the diagnosis later
+ * without reinstalling, which is when they will actually need it.
+ */
+async function doctor(): Promise<void> {
+  let ok = true
+
+  for (const [label, container, port] of [
+    ['indexer (Fulcrum)', 'fulcrum', FULCRUM_PORT],
+    ['soroban', 'soroban', SOROBAN_PORT],
+  ] as const) {
+    const candidates = await candidatesFor(container, port)
+    const result =
+      container === 'fulcrum' ? await probeElectrum(candidates) : await probeSoroban(candidates)
+
+    console.log(`\n  ${label}`)
+    for (const attempt of result.attempts) {
+      const { host, port: p, why } = attempt.candidate
+      const mark = attempt.error ? '·' : '✓'
+      const detail = attempt.error ? `  (${attempt.error})` : ''
+      console.log(`    ${mark} ${host}:${p}  ${why}${detail}`)
+    }
+    if (result.found) {
+      const { host, port: p } = result.found
+      console.log(`    -> using ${container === 'soroban' ? sorobanUrlFor(result.found) : `${host}:${p}`}`)
+    } else {
+      ok = false
+      console.log('')
+      for (const line of remedyFor(container === 'fulcrum' ? 'indexer' : 'soroban').split('\n')) {
+        console.log(`    ${line}`)
+      }
+    }
+  }
+
+  console.log('')
+  if (!ok) process.exit(1)
+}
+
 try {
   if (command === 'init') await init()
   else if (command === 'status') status()
   else if (command === 'serve') serve()
   else if (command === 'start') start()
+  else if (command === 'doctor') await doctor()
   else {
     console.error(
-      'usage: paynym-bot <init|status|serve|start> [--network mainnet|testnet] [--label <name>] [--data <dir>]',
+      'usage: paynym-bot <init|status|serve|start|doctor> ' +
+        '[--network mainnet|testnet] [--label <name>] [--data <dir>]',
     )
     process.exit(1)
   }
