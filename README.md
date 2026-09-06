@@ -14,11 +14,42 @@ of over the chain. The customer pays once.
 
 The bot **derives and watches** receive addresses. It does not spend.
 
+## Install
+
+On a Debian 12 / Ubuntu 24.04 box that already runs a Dojo:
+
+```bash
+git clone https://github.com/linkinparkrulz/paynym-bot && cd paynym-bot
+./install.sh --dry-run     # see exactly what it would do, change nothing
+./install.sh               # guided install
+```
+
+The installer asks where to install, **which network** (permanent — see below), a shop
+name, and whether to generate a recovery phrase or import one you already have. It then
+finds your Dojo's indexer and Soroban, creates a service account, adds a Tor hidden
+service **without disturbing any other service in your torrc**, and installs a hardened
+systemd unit.
+
+It **stops before installing anything** if it cannot reach your Dojo, and tells you how
+to fix it — a receiver that cannot see the chain can never notice a payment. Re-run that
+diagnosis any time with `paynym-bot doctor`.
+
+Removal is a dry run unless you ask for it:
+
+```bash
+./uninstall.sh                                   # show the plan
+sudo ./uninstall.sh --apply                      # stop serving, keep wallet and data
+sudo ./uninstall.sh --apply --purge-data         # also delete the wallet and customers
+```
+
+## Commands
+
 ```
 paynym-bot init --network testnet   # choose the network once; it is permanent
 paynym-bot start                    # storefront + listen for customers + scan for payments
 paynym-bot status                   # network, PayNym, what is being watched
 paynym-bot serve                    # storefront only, no daemon
+paynym-bot doctor                   # find the Dojo services, or explain why not
 ```
 
 `init` generates a **12-word BIP39 recovery phrase** and shows it once, or imports one you
@@ -165,7 +196,10 @@ disturbing anything above it.
 | `src/state.ts` | Durable state, atomic writes, and the permanent network lock. |
 | `src/server.ts` | The onion-facing storefront. Exposes the PayNym and nothing else. |
 | `src/config.ts` | Paths and local service endpoints. |
-| `bin/paynym-bot.ts` | CLI: `init`, `serve`, `status`. |
+| `src/discover.ts` | Finds the Dojo's indexer and Soroban, proven by protocol not open ports. |
+| `src/torrc.ts` | Merges our hidden service into a shared torrc, reversibly. |
+| `bin/paynym-bot.ts` | CLI: `init`, `start`, `serve`, `status`, `doctor`. |
+| `install.sh`, `uninstall.sh` | Guided install and reversible removal. |
 | `test/` | Vector gate, protocol, regressions, state, storefront. |
 
 ## Operating the receiver
@@ -205,6 +239,10 @@ disturbing anything above it.
 - Used-address oracle over the Electrum protocol, against Fulcrum or any electrs. ✅
 - Daemon: listen and scan on guarded timers, state persisted before an inbox entry is
   removed, restart reproduces the watch window exactly. ✅
+- Wallet: 12-word BIP39 phrase, generated or imported, verified against the BIP39
+  vectors. ✅
+- Deployment: guided installer with dry-run, Dojo service detection, reversible torrc
+  merge, hardened systemd unit, and a dry-run-by-default uninstaller. ✅
 - **Not yet done:** an acceptance run on testnet against a real Dojo — open the onion,
   register from a wallet, send a payment, watch it credited with no notification
   transaction on chain. Everything above is exercised offline; that run is what proves
