@@ -3,7 +3,8 @@
 //
 //   paynym-bot init [--network mainnet|testnet] [--label <name>] [--data <dir>] [--force]
 //   paynym-bot status [--data <dir>]
-//   paynym-bot serve [--data <dir>]
+//   paynym-bot serve [--data <dir>]          storefront only
+//   paynym-bot start [--data <dir>]          storefront + listen + scan
 //
 // init is the guided setup: it asks which network to run on, generates the
 // seed, and writes the state file. That network choice is permanent — see the
@@ -14,8 +15,11 @@ import { randomBytes } from 'node:crypto'
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { createInterface } from 'node:readline/promises'
 import { PaynymIdentity } from '../src/identity.ts'
-import { Registry } from '../src/register.ts'
+import { Registrar, Registry } from '../src/register.ts'
 import { watchWindow } from '../src/watcher.ts'
+import { SorobanRPC } from '../src/soroban.ts'
+import { ElectrumClient, electrumUsedChecker } from '../src/electrum.ts'
+import { Daemon } from '../src/daemon.ts'
 import { loadConfig } from '../src/config.ts'
 import { createStorefront } from '../src/server.ts'
 import {
@@ -176,13 +180,68 @@ function serve(): void {
   process.on('SIGTERM', shutdown)
 }
 
+function start(): void {
+  const state = loadState(config.statePath)
+  if (isNetworkName(values.network)) assertNetworkMatches(state, values.network)
+
+  const network = networkFor(state.network)
+  const identity = PaynymIdentity.fromSeed(loadSeed(config.seedPath), network)
+  const registry = Registry.fromJSON(state.senders)
+  const registrar = new Registrar(identity, registry)
+
+  const rpc = SorobanRPC.forUrl(config.sorobanUrl)
+  const electrum = new ElectrumClient({
+    host: config.electrumHost,
+    port: config.electrumPort,
+  })
+
+  const daemon = new Daemon({
+    identity,
+    registrar,
+    rpc,
+    isUsed: electrumUsedChecker(electrum, network),
+    // Rewrite the whole record set: it is small, and an atomic replace cannot
+    // leave a half-updated registry behind.
+    persist: async () => {
+      saveState(config.statePath, { ...state, senders: registry.toJSON() })
+    },
+    log: (line) => console.log(`[${new Date().toISOString()}] ${line}`),
+  })
+
+  const server = createStorefront({
+    identity,
+    network: state.network,
+    label: values.label ?? state.label,
+  })
+
+  server.listen(config.httpPort, '127.0.0.1', () => {
+    console.log(`\n  network:     ${state.network}`)
+    console.log(`  PayNym:      ${identity.paymentCode()}`)
+    console.log(`  storefront:  http://127.0.0.1:${config.httpPort}`)
+    console.log(`  soroban:     ${config.sorobanUrl}`)
+    console.log(`  indexer:     ${config.electrumHost}:${config.electrumPort}`)
+    console.log(`  customers:   ${state.senders.length}\n`)
+    daemon.start()
+  })
+
+  const shutdown = () => {
+    daemon.stop()
+    electrum.close()
+    server.close(() => process.exit(0))
+    setTimeout(() => process.exit(0), 3000).unref()
+  }
+  process.on('SIGINT', shutdown)
+  process.on('SIGTERM', shutdown)
+}
+
 try {
   if (command === 'init') await init()
   else if (command === 'status') status()
   else if (command === 'serve') serve()
+  else if (command === 'start') start()
   else {
     console.error(
-      'usage: paynym-bot <init|status|serve> [--network mainnet|testnet] [--label <name>] [--data <dir>]',
+      'usage: paynym-bot <init|status|serve|start> [--network mainnet|testnet] [--label <name>] [--data <dir>]',
     )
     process.exit(1)
   }

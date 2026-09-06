@@ -18,7 +18,15 @@ export type WatchAddress = {
   address: string
 }
 
-/** Build the current watch window across all registered senders. */
+/**
+ * Build the current watch window: the next `gap` indices per sender that are
+ * not already known to be used.
+ *
+ * Known-used indices above the cursor are skipped rather than counted, so the
+ * window always covers `gap` genuinely unused addresses. That keeps a customer
+ * who pays out of order from shrinking the lookahead, and stops an
+ * already-credited address being re-reported on every pass.
+ */
 export function watchWindow(
   identity: PaynymIdentity,
   registry: Registry,
@@ -26,8 +34,12 @@ export function watchWindow(
 ): WatchAddress[] {
   const out: WatchAddress[] = []
   for (const rec of registry.all()) {
-    for (let i = rec.nextIndex; i < rec.nextIndex + gap; i++) {
+    const used = new Set(rec.usedAhead ?? [])
+    let emitted = 0
+    for (let i = rec.nextIndex; emitted < gap; i++) {
+      if (used.has(i)) continue
       out.push({ paymentCode: rec.paymentCode, index: i, address: identity.receiveAddress(rec.paymentCode, i) })
+      emitted++
     }
   }
   return out

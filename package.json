@@ -9,10 +9,11 @@
     "vectors": "node --experimental-strip-types --no-warnings test/vectors.test.ts",
     "protocol": "node --experimental-strip-types --no-warnings test/protocol.test.ts",
     "regress": "node --experimental-strip-types --no-warnings test/register-fixes.test.ts",
-    "test": "npm run vectors && npm run protocol && npm run regress && npm run state && npm run server && npm run electrum",
+    "test": "npm run vectors && npm run protocol && npm run regress && npm run state && npm run server && npm run electrum && npm run daemon",
     "state": "node --experimental-strip-types --no-warnings test/state.test.ts",
     "server": "node --experimental-strip-types --no-warnings test/server.test.ts",
-    "electrum": "node --experimental-strip-types --no-warnings test/electrum.test.ts"
+    "electrum": "node --experimental-strip-types --no-warnings test/electrum.test.ts",
+    "daemon": "node --experimental-strip-types --no-warnings test/daemon.test.ts"
   },
   "dependencies": {
     "@noble/curves": "^1.7.0",

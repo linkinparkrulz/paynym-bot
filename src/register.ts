@@ -126,7 +126,13 @@ export type SenderRecord = {
   paymentCode: string
   label?: string
   firstSeen: number
-  nextIndex: number // next receive index we expect to be unused
+  /**
+   * First index never seen used. Everything BELOW this is known used; the
+   * sparse indices at or above it that are known used live in `usedAhead`.
+   */
+  nextIndex: number
+  /** Known-used indices above the cursor, ascending. Normally empty. */
+  usedAhead?: number[]
 }
 
 /**
@@ -152,10 +158,26 @@ export class Registry {
     this.records.set(paymentCode, { paymentCode, label, firstSeen: now, nextIndex: 0 })
     return true
   }
-  /** Advance a sender's cursor after crediting a payment at `index`. */
+  /**
+   * Record that `usedIndex` has been paid, and advance the cursor across any
+   * CONTIGUOUS run of used indices.
+   *
+   * The cursor must not simply jump past the highest index seen. Customers pay
+   * out of order — a wallet can skip an index, or a payment can confirm late —
+   * and a cursor that leapt to `usedIndex + 1` abandoned every gap beneath it,
+   * so a later payment to a skipped index was never watched for and silently
+   * went unnoticed. This is the standard gap-limit rule instead.
+   */
   advance(paymentCode: string, usedIndex: number): void {
     const rec = this.records.get(paymentCode)
-    if (rec && usedIndex >= rec.nextIndex) rec.nextIndex = usedIndex + 1
+    if (!rec || usedIndex < rec.nextIndex) return // already accounted for
+    const ahead = new Set(rec.usedAhead ?? [])
+    ahead.add(usedIndex)
+    while (ahead.has(rec.nextIndex)) {
+      ahead.delete(rec.nextIndex)
+      rec.nextIndex++
+    }
+    rec.usedAhead = [...ahead].sort((a, b) => a - b)
   }
 
   toJSON(): SenderRecord[] {

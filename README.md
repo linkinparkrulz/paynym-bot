@@ -16,8 +16,9 @@ The bot **derives and watches** receive addresses. It does not spend.
 
 ```
 paynym-bot init --network testnet   # choose the network once; it is permanent
-paynym-bot serve                    # storefront on loopback, Tor maps the onion
+paynym-bot start                    # storefront + listen for customers + scan for payments
 paynym-bot status                   # network, PayNym, what is being watched
+paynym-bot serve                    # storefront only, no daemon
 ```
 
 ## Why this works (and it isn't a hack)
@@ -185,10 +186,17 @@ disturbing anything above it.
   and testnet. ✅
 - Registration: offline end-to-end, including forged-signature, wrong-merchant, and
   attacker-writes-to-inbox cases. ✅
-- Storefront: serving the PayNym over loopback for Tor to publish. ✅
-- Init and durable state with a permanent network lock. ✅
-- Next: the used-address oracle against Fulcrum (so the bot can actually see a payment
-  arrive), then the daemon loop.
+- Storefront: serves the PayNym over loopback for Tor to publish, and nothing else. ✅
+- Init and durable state, with a permanent network lock. ✅
+- Used-address oracle over the Electrum protocol, against Fulcrum or any electrs. ✅
+- Daemon: listen and scan on guarded timers, state persisted before an inbox entry is
+  removed, restart reproduces the watch window exactly. ✅
+- **Not yet done:** an acceptance run on testnet against a real Dojo — open the onion,
+  register from a wallet, send a payment, watch it credited with no notification
+  transaction on chain. Everything above is exercised offline; that run is what proves
+  it against a real chain.
+- Also outstanding: byte-compatibility with Samourai's `Bip47Encrypter` (see above), a
+  QR on the storefront, and sender-side index persistence.
 
 ## Requirements
 
