@@ -95,7 +95,12 @@ export function verifyIdentitySignature(
 ): boolean {
   try {
     const digest = sha256(message)
-    return secp256k1.verify(derSignatureHex, digest, identityPublicKeyHex)
+    // Parse the DER explicitly and hand verify() a fixed 64-byte compact
+    // signature. Passing the DER hex straight through relied on verify()
+    // guessing the encoding, which is both untyped and ambiguous.
+    const der = Uint8Array.from(Buffer.from(derSignatureHex, 'hex'))
+    const compact = secp256k1.Signature.fromDER(der).toCompactRawBytes()
+    return secp256k1.verify(compact, digest, Uint8Array.from(Buffer.from(identityPublicKeyHex, 'hex')))
   } catch {
     return false
   }

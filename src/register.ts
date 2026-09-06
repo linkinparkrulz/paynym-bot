@@ -1,29 +1,43 @@
 // Notification-less BIP47 registration over Soroban.
 //
-// The BIP47 notification transaction does two jobs, both pure transport:
-//   1. deliver the sender's payment code to the receiver, and
-//   2. blind it so chain observers can't read it.
-// This module does both off-chain: the sender hands their payment code to the
-// receiver inside a Soroban message that is encrypted to the receiver's box key
-// (job 2) and delivered to a directory derived from the receiver's payment code
-// (job 1). No on-chain OP_RETURN is broadcast.
+// A BIP47 payment to a new counterparty normally costs TWO transactions: a
+// notification transaction to connect, then the real payment. Between regulars
+// that amortises. For a merchant it never does — every customer is a first
+// payment — so the notification transaction is pure overhead on every
+// one-time payer.
 //
-// Authentication note (the correction to the "Soroban self-authenticates"
-// assumption): a Soroban channel is keyed with EPHEMERAL Curve25519 box keys,
-// not the BIP47 secp256k1 payment-code keys, so decrypting a message proves
-// nothing about payment-code control. We therefore make the sender SIGN the
-// registration with the payment code's own identity key (secp256k1 child-0),
-// and the receiver verifies that signature against the pubkey embedded in the
-// submitted payment code. That is what actually binds "this message" to "the
-// holder of this payment code".
+// The notification transaction is a mailbox for a recipient who might not be
+// there. This receiver is always online, so the mailbox is unnecessary: the
+// customer hands over their payment code directly, over Soroban, and both
+// sides derive the same receive address.
+//
+// Two things must hold, and neither is provided by the transport:
+//
+//   Confidentiality — the customer's payment code must not be readable by
+//     onlookers. Handled in ./channel.ts, which encrypts to the merchant's
+//     child-0 key derived from the payment code the customer already has.
+//     Nothing is published, so there is nothing for an attacker to substitute.
+//
+//   Authenticity — a submitted payment code must be proven to belong to
+//     whoever sent it. Decrypting proves only that the sender could encrypt to
+//     us, which anyone holding our public payment code can do. So the envelope
+//     is SIGNED with the payment code's own identity key (secp256k1 child-0)
+//     and verified against the pubkey embedded in the submitted code.
 
 import { nodeFromPaymentCode } from './bip47.ts'
 import { PaynymIdentity, verifyIdentitySignature } from './identity.ts'
-import { SorobanRPC, BoxKeypair, encodeDirectory, hex, unhex } from './soroban.ts'
+import { openWithIdentityKey, sealToPaymentCode } from './channel.ts'
+import { SorobanRPC, encodeDirectory, hex } from './soroban.ts'
 import type { ConfidentialAuth, Mode } from './soroban.ts'
 
 export const PROTOCOL = 'paynym.register'
-export const PROTOCOL_VERSION = 1
+
+// v2: the signed message now names the RECEIVER as well as the sender. Under
+// v1 an envelope captured from one receiver replayed verbatim into any other,
+// registering a customer with a merchant they never contacted. v1 envelopes are
+// rejected rather than accepted for compatibility: both ends of this protocol
+// are ours, so there is no legacy to carry.
+export const PROTOCOL_VERSION = 2
 
 // Replay window for a registration envelope.
 const MAX_SKEW_MS = 6 * 60 * 60 * 1000 // 6 hours
@@ -36,8 +50,14 @@ export type RegisterEnvelope = {
   sig: string // secp256k1 DER hex over sha256(signedMessage)
 }
 
-function signedMessage(paymentCode: string, ts: number): Uint8Array {
-  return new TextEncoder().encode(`${PROTOCOL}|${paymentCode}|${ts}`)
+function signedMessage(
+  receiverPaymentCode: string,
+  senderPaymentCode: string,
+  ts: number,
+): Uint8Array {
+  return new TextEncoder().encode(
+    `${PROTOCOL}|${receiverPaymentCode}|${senderPaymentCode}|${ts}`,
+  )
 }
 
 /** Identity pubkey (hex) that must have signed a registration for `paymentCode`. */
@@ -45,20 +65,28 @@ function identityKeyOf(paymentCode: string): string {
   return hex(nodeFromPaymentCode(paymentCode).deriveChild(0).publicKey!)
 }
 
-/** Sender: build a signed registration envelope disclosing our payment code. */
-export function buildRegisterEnvelope(sender: PaynymIdentity, ts = Date.now()): RegisterEnvelope {
+/** Customer: build a signed envelope disclosing our payment code to one merchant. */
+export function buildRegisterEnvelope(
+  sender: PaynymIdentity,
+  receiverPaymentCode: string,
+  ts = Date.now(),
+): RegisterEnvelope {
   const paymentCode = sender.paymentCode()
   return {
     v: PROTOCOL_VERSION,
     type: PROTOCOL,
     paymentCode,
     ts,
-    sig: sender.signIdentity(signedMessage(paymentCode, ts)),
+    sig: sender.signIdentity(signedMessage(receiverPaymentCode, paymentCode, ts)),
   }
 }
 
-/** Receiver: validate an envelope. Returns the payment code, or null if invalid. */
-export function verifyRegisterEnvelope(env: RegisterEnvelope, now = Date.now()): string | null {
+/** Merchant: validate an envelope addressed to us. Returns the payment code, or null. */
+export function verifyRegisterEnvelope(
+  env: RegisterEnvelope,
+  receiverPaymentCode: string,
+  now = Date.now(),
+): string | null {
   if (!env || env.type !== PROTOCOL || env.v !== PROTOCOL_VERSION) return null
   if (typeof env.paymentCode !== 'string' || typeof env.sig !== 'string') return null
   if (typeof env.ts !== 'number' || Math.abs(now - env.ts) > MAX_SKEW_MS) return null
@@ -68,27 +96,22 @@ export function verifyRegisterEnvelope(env: RegisterEnvelope, now = Date.now()):
   } catch {
     return null
   }
-  const ok = verifyIdentitySignature(identityKey, signedMessage(env.paymentCode, env.ts), env.sig)
+  const ok = verifyIdentitySignature(
+    identityKey,
+    signedMessage(receiverPaymentCode, env.paymentCode, env.ts),
+    env.sig,
+  )
   return ok ? env.paymentCode : null
 }
 
 // --- Directory addressing ---------------------------------------------------
 //
-// Two schemes. `plain` works on any public node (contents are box-encrypted so
-// listers see only ciphertext). `confidential` additionally hides the queue
-// itself behind the node's `soroban.register-queue.*` confidential prefix, so
-// only the receiver (holding the configured ed25519 key) can even List it —
-// this requires the node operator to add the receiver's key to confidential.yml.
+// `plain` works on any node; contents are encrypted so listers see ciphertext.
+// `confidential` additionally hides the queue behind the node's
+// `soroban.register-queue.*` prefix, whose List requires an Ed25519 signature —
+// worth using when you run the node, which a Dojo-side deployment does.
 
 export type Scheme = 'plain' | 'confidential'
-
-export function rendezvousName(receiverPaymentCode: string, scheme: Scheme = 'plain'): string {
-  if (scheme === 'confidential') {
-    // Raw prefix so the node's regex can match; hashed id so the PC isn't leaked.
-    return `soroban.register-queue.rv.${encodeDirectory(receiverPaymentCode)}`
-  }
-  return encodeDirectory(`${PROTOCOL}.rendezvous.${receiverPaymentCode}`)
-}
 
 export function inboxName(receiverPaymentCode: string, scheme: Scheme = 'plain'): string {
   if (scheme === 'confidential') {
@@ -107,9 +130,9 @@ export type SenderRecord = {
 }
 
 /**
- * The set of senders that have registered with us. This is key material: the
- * receive keys cannot be re-derived from the seed alone without these payment
- * codes. Persist it (toJSON / fromJSON) alongside the seed.
+ * The customers who have registered with us. This is key material: receive keys
+ * cannot be re-derived from the seed alone, because a BIP47 address depends on
+ * BOTH parties' payment codes. Persist it alongside the seed.
  */
 export class Registry {
   private records = new Map<string, SenderRecord>()
@@ -145,88 +168,45 @@ export class Registry {
   }
 }
 
-// --- Sender side ------------------------------------------------------------
+// --- Customer side ----------------------------------------------------------
 
 /**
- * Non-destructive list-with-retry, preserving waitAndRemove's polling behaviour
- * without its remove-on-read. Used for the rendezvous key, which is shared
- * state (§4.1): a single-use handshake token is consumed on read; a published
- * box key is deliberately broadcast to any number of senders.
- */
-async function listWithRetry(
-  rpc: SorobanRPC,
-  name: string,
-  opts: { tries?: number; intervalMs?: number } = {},
-): Promise<string[]> {
-  const tries = opts.tries ?? 25
-  const intervalMs = opts.intervalMs ?? 200
-  for (let i = 0; i < tries; i++) {
-    const values = await rpc.list(name)
-    if (values.length > 0) return values
-    await new Promise((r) => setTimeout(r, intervalMs))
-  }
-  return []
-}
-
-/**
- * Register our payment code with a receiver so they can watch for our payments,
- * with no notification transaction. Fetches the receiver's rendezvous box key,
- * encrypts a signed envelope to it, and posts it to the receiver's inbox.
- * Returns true if the inbox Add succeeded.
+ * Register our payment code with a merchant so they can watch for our payments,
+ * with no notification transaction. The merchant's payment code — read from
+ * their onion page — is the only input needed: it yields both the inbox to post
+ * to and the key to encrypt under. Returns true if the Add succeeded.
  */
 export async function registerWithReceiver(
   rpc: SorobanRPC,
   sender: PaynymIdentity,
   receiverPaymentCode: string,
-  opts: { scheme?: Scheme; mode?: Mode; tries?: number } = {},
+  opts: { scheme?: Scheme; mode?: Mode } = {},
 ): Promise<boolean> {
-  const scheme = opts.scheme ?? 'plain'
-  const box = BoxKeypair.generate()
-
-  // §4.1: read the rendezvous key NON-destructively. The entry is a public key
-  // the receiver deliberately broadcasts; consuming it on first read (the old
-  // waitAndRemove path) made every later sender fail until the next publish
-  // tick. Take the last entry, matching waitAndRemove's choice, so a receiver
-  // that just rotated its box key wins over a stale one still inside its TTL.
-  // Node behaviour (confirmed against soroban internal/memory/memory.go): Add
-  // of an identical entry refreshes the TTL and does NOT append a duplicate,
-  // so list length is normally 1 — but we never assume that.
-  const entries = await listWithRetry(rpc, rendezvousName(receiverPaymentCode, scheme), {
-    tries: opts.tries ?? 25,
-  })
-  const receiverBoxHex = entries.length ? entries[entries.length - 1] : null
-  if (!receiverBoxHex) throw new Error('receiver rendezvous key not found (is the receiver online?)')
-
-  const envelope = JSON.stringify(buildRegisterEnvelope(sender))
-  // Prepend our ephemeral box pubkey so the receiver can open the box.
-  const sealed = `${box.publicKeyHex()}:${box.encrypt(envelope, unhex(receiverBoxHex))}`
-  return rpc.add(inboxName(receiverPaymentCode, scheme), sealed, opts.mode ?? 'long')
+  const envelope = JSON.stringify(buildRegisterEnvelope(sender, receiverPaymentCode))
+  const sealed = sealToPaymentCode(receiverPaymentCode, envelope)
+  return rpc.add(inboxName(receiverPaymentCode, opts.scheme ?? 'plain'), sealed, opts.mode ?? 'long')
 }
 
-// --- Receiver side ----------------------------------------------------------
+// --- Merchant side ----------------------------------------------------------
 
 /**
- * The always-online receiver. Holds a persistent box keypair (for decrypting
- * inbound envelopes) and the sender registry. Call publishRendezvous() on a
- * timer so senders can always find our box key, and poll() to intake pending
- * registrations.
+ * The always-online receiver. Holds the registry and drains the inbox. There is
+ * no rendezvous key to publish and no box keypair to persist: the channel key
+ * comes from our own payment code, which customers already have.
  */
 export class Registrar {
   readonly identity: PaynymIdentity
   readonly registry: Registry
-  private readonly box: BoxKeypair
   private readonly scheme: Scheme
   private readonly auth?: ConfidentialAuth
   private rejectCount = 0
 
   constructor(
     identity: PaynymIdentity,
-    box: BoxKeypair,
     registry: Registry = new Registry(),
     opts: { scheme?: Scheme; auth?: ConfidentialAuth } = {},
   ) {
     this.identity = identity
-    this.box = box
     this.registry = registry
     this.scheme = opts.scheme ?? 'plain'
     if (this.scheme === 'confidential' && !opts.auth) {
@@ -235,37 +215,33 @@ export class Registrar {
     this.auth = opts.auth
   }
 
-  boxPublicKeyHex(): string {
-    return this.box.publicKeyHex()
-  }
-
-  /** Re-publish our rendezvous box key. Call on a timer (Soroban TTL <= 15m). */
-  async publishRendezvous(rpc: SorobanRPC, mode: Mode = 'long'): Promise<boolean> {
-    return rpc.add(rendezvousName(this.identity.paymentCode(), this.scheme), this.box.publicKeyHex(), mode)
+  /** The directory customers post their registrations to. */
+  inbox(): string {
+    return inboxName(this.identity.paymentCode(), this.scheme)
   }
 
   /**
-   * Drain the inbox: decrypt, verify signatures, register new senders.
-   * Returns the payment codes newly added to the registry this call.
+   * Drain the inbox: decrypt, verify signatures, register new customers.
+   * Returns the payment codes newly added this call.
    *
-   * Durability contract (§4.2): a registration is only reported after
-   * `onAccepted` has resolved, and the inbox entry is only removed after that.
-   * If `onAccepted` throws, the exception propagates BEFORE the entry is
-   * removed, so the only remaining copy survives to be re-ingested next tick
-   * (idempotent: Registry.add returns false for a code it already holds).
+   * Durability: a registration is only reported after `onAccepted` resolves,
+   * and the entry is only removed after that. If `onAccepted` throws, the
+   * exception propagates BEFORE the removal, so the only remaining copy
+   * survives to be re-ingested next tick (idempotent: Registry.add returns
+   * false for a code it already holds).
    */
   async poll(
     rpc: SorobanRPC,
     opts: { onAccepted?: (paymentCode: string) => Promise<void> } = {},
   ): Promise<string[]> {
-    const name = inboxName(this.identity.paymentCode(), this.scheme)
+    const name = this.inbox()
     const entries = await rpc.list(name, this.auth)
     const added: string[] = []
     for (const entry of entries) {
       const paymentCode = this.ingest(entry)
       if (!paymentCode) {
-        // Malformed / unverifiable: count it, remove it, continue — a bad entry
-        // must never pin the queue (§4.3). Never log the ciphertext.
+        // Malformed or unverifiable: count it, remove it, continue. A bad entry
+        // must never pin the queue. Never log the ciphertext.
         this.rejectCount++
       } else if (this.registry.add(paymentCode)) {
         if (opts.onAccepted) await opts.onAccepted(paymentCode) // durable before removal
@@ -283,16 +259,7 @@ export class Registrar {
 
   /** Decrypt + verify a single sealed inbox entry. Returns the payment code or null. */
   ingest(sealed: string): string | null {
-    const sep = sealed.indexOf(':')
-    if (sep < 0) return null
-    const senderBoxHex = sealed.slice(0, sep)
-    const ciphertext = sealed.slice(sep + 1)
-    let plaintext: string | null
-    try {
-      plaintext = this.box.decrypt(ciphertext, unhex(senderBoxHex))
-    } catch {
-      return null
-    }
+    const plaintext = openWithIdentityKey(this.identity.identityPrivateKey(), sealed)
     if (!plaintext) return null
     let env: RegisterEnvelope
     try {
@@ -300,6 +267,6 @@ export class Registrar {
     } catch {
       return null
     }
-    return verifyRegisterEnvelope(env)
+    return verifyRegisterEnvelope(env, this.identity.paymentCode())
   }
 }

@@ -1,12 +1,24 @@
-# paynym-bot — always-online BIP47 receiver, no notification transaction
+# paynym-bot — take BIP47 payments without a notification transaction
 
-A self-custody BIP47 receiver that accepts payments **without** the sender first
-broadcasting an on-chain notification (OP_RETURN) transaction. The sender's
-payment code is delivered over [Soroban](https://github.com/linkinparkrulz/soroban)
-— an encrypted, Tor-based directory — instead of over the chain.
+A BIP47 payment to a **new** counterparty costs two transactions: a notification
+transaction to connect, then the real payment. Between regulars that cost amortises
+over many payments and nobody minds. **For a merchant it never amortises** — every
+customer is a first payment — so the notification transaction is pure overhead on
+every one-time payer, and the customer is the one who pays it.
 
-This is built for **your own funds**: you control both the sender tool and the
-receiver bot. It is not a service that receives on behalf of other people.
+This is an always-online receiver that removes it. It runs beside a
+[Dojo](https://github.com/Dojo-Open-Source-Project/samourai-dojo), publishes an onion
+page showing its PayNym, and trades the secrets needed to derive a receive address with
+the customer over [Soroban](https://github.com/Archive-Samourai-Wallet/soroban) instead
+of over the chain. The customer pays once.
+
+The bot **derives and watches** receive addresses. It does not spend.
+
+```
+paynym-bot init --network testnet   # choose the network once; it is permanent
+paynym-bot serve                    # storefront on loopback, Tor maps the onion
+paynym-bot status                   # network, PayNym, what is being watched
+```
 
 ## Why this works (and it isn't a hack)
 
@@ -14,19 +26,24 @@ A BIP47 receive address is a pure function of the two parties' payment codes.
 Nothing in the derivation references a txid, an outpoint, or any on-chain data
 — verify this in [`src/bip47.ts`](src/bip47.ts): it never sees the chain.
 
-The notification transaction does exactly two jobs, both pure transport:
+The notification transaction is a **mailbox for a recipient who might not be there**.
+Alice wants to pay Bob; Bob may be running nothing at all, so Alice needs somewhere to
+leave her payment code that will still be there whenever Bob next appears. The chain
+supplies that: always available, infinite retention, no liveness required.
 
-1. **deliver** the sender's payment code to the receiver, and
-2. **blind** that code so chain observers can't link the two parties.
+Guarantee presence and the requirement evaporates. That is why this is a *bot* — the
+always-online property is the premise of the construction, not an operational detail
+of it. Nothing weaker replaces the mailbox; the need for one is removed.
 
-Deliver the code over an encrypted channel instead and both jobs disappear — the
-resulting on-chain payment is a plain P2PKH send, byte-for-byte identical to any
+The resulting on-chain payment is a plain P2PKH send, byte-for-byte identical to any
 other BIP47 payment. The BIP47 spec even reserves a features bit for non-chain
 notification, so this is anticipated, not worked around.
 
-The one hard constraint: **both ends must run notification-skipping code.** A
-stock wallet only looks for your addresses after it has seen a notification, so
-it would never find these. Since you run both sides, that's fully in hand.
+**What it concedes.** The chain needs no liveness from either party and cannot be
+censored; this needs the merchant online and reachable. For a merchant that is a
+property they already need. **Both ends must also run notification-skipping code** — a
+stock wallet only looks for your addresses once it has seen a notification, so it would
+never find these.
 
 ## The derivation (the load-bearing math)
 
@@ -64,83 +81,114 @@ Do not trust anything downstream until `npm run vectors` prints `PASS`.
 
 ## How Soroban carries the payment code
 
-Grounded in Soroban's actual wire protocol (`services/directory.go`,
-`internal/common/ttl.go`, and the reference clients under `clients/` in the
-[Soroban repo](https://github.com/linkinparkrulz/soroban)):
+Grounded in Soroban's wire protocol (`services/directory.go`, `internal/common/ttl.go`
+and the reference clients in the [Soroban repo](https://github.com/Archive-Samourai-Wallet/soroban)):
 
-- JSON-RPC 2.0 over HTTP POST to a node's `/rpc` (usually a `.onion` over Tor).
-  Methods: `directory.List` / `directory.Add` / `directory.Remove`.
-- A "directory" is just a key string, addressed by its **SHA256 hex** so the
-  node never sees the readable name.
-- Entries are opaque strings with a TTL by `Mode`: `fast`=15s, `short`=1m,
-  `long`=5m, `default`=3m (node caps at 15m). An always-online receiver just
-  re-publishes on a timer.
+- JSON-RPC 2.0 over HTTP POST to a node's `/rpc`. Methods: `directory.List` /
+  `directory.Add` / `directory.Remove`.
+- A "directory" is just a key string, addressed by its **SHA256 hex** so the node never
+  sees the readable name.
+- Entries are opaque strings with a TTL by `Mode`: `fast`=15s, `short`=1m, `long`=5m,
+  `default`=3m (node caps at 15m).
 
-### Registration flow ([`src/register.ts`](src/register.ts))
+In a Dojo-side deployment Soroban sits on the same host, so the bot reaches it over
+loopback and needs no SOCKS client. Tor is `torrc` configuration for the hidden service
+the bot *exposes*.
 
-1. Receiver publishes its **rendezvous box key** to a directory derived from its
-   own payment code, and re-publishes on a timer.
-2. Sender fetches that box key, wraps a signed registration envelope
-   (`{ paymentCode, ts, sig }`) in a NaCl box to the receiver, and `Add`s it to
-   the receiver's inbox directory. No transaction is broadcast.
-3. Receiver drains the inbox, decrypts, verifies, and records the sender.
-4. From then on the receiver watches `receiveAddress(senderCode, i…i+gap)` and
-   the sender pays the identical `sendAddress(receiverCode, i)`.
+### Registration ([`src/register.ts`](src/register.ts))
 
-### Correction: Soroban does **not** authenticate payment codes
+1. The customer reads the merchant's payment code from the onion page.
+2. That single value yields both the inbox directory to post to and the key to encrypt
+   under. The customer seals a signed envelope and `Add`s it. No transaction is broadcast.
+3. The merchant drains the inbox, decrypts, verifies, and records the customer.
+4. From then on the merchant watches `receiveAddress(customerCode, i…i+gap)` and the
+   customer pays the identical `sendAddress(merchantCode, i)`.
 
-A Soroban channel is keyed with **ephemeral Curve25519 box keys**, not the
-BIP47 secp256k1 payment-code keys. Decrypting a Soroban message proves the peer
-holds the ephemeral box key and says *nothing* about who controls a payment
-code. So the registration envelope is **signed with the payment code's own
-identity key** (secp256k1 child-0), and the receiver verifies that signature
-against the pubkey embedded in the submitted code. That app-layer signature —
-not the transport — is what binds a registration to the holder of the code.
-`test/protocol.test.ts` includes a forged-envelope case to prove a mismatched
-signature is rejected.
+There is **no rendezvous key and no key exchange**. An earlier design had the merchant
+publish an ephemeral NaCl box key for customers to fetch; that key was unauthenticated,
+so anyone able to write to the directory could publish a competing one and harvest
+customers' payment codes in the clear. Publishing a key at all was the mistake.
 
-### Optional: confidential inbox
+### The channel ([`src/channel.ts`](src/channel.ts))
 
-By default the inbox works on any public node and its contents are box-encrypted
-(listers see only ciphertext). Soroban also ships a confidential prefix,
-`soroban.register-queue.*` in its `confidential.yml`, whose `List` requires an
-Ed25519 signature — so only the receiver can even enumerate the queue. To use
-it, run your own node, replace that prefix's `publickey` with your Ed25519 key,
-and construct the `Registrar` with `scheme: 'confidential'` and a
-`naclSigner(...)` auth. See `ConfidentialAuth` in [`src/soroban.ts`](src/soroban.ts).
+Confidentiality mirrors BIP47's own notification transaction. On-chain, Alice reveals an
+ephemeral public key in the clear and blinds the payload with ECDH against Bob's
+notification key. We do the same off-chain:
+
+```
+sealed = <ephemeral pubkey, clear> ":" secretbox(payload, SHA256(ECDH(eph, B_0).x))
+```
+
+`B_0` is the merchant's child-0 key — a pure function of the payment code the customer
+already holds. Nothing is published, so there is nothing to substitute.
+
+### Authenticity is app-layer, not transport
+
+Decrypting proves only that the sender could encrypt to us, which anyone holding our
+public payment code can do. So the envelope is **signed with the payment code's own
+identity key** (secp256k1 child-0) and verified against the pubkey embedded in the
+submitted code. The signed message names **both** parties, so an envelope addressed to
+one merchant cannot be replayed into another's inbox. `test/protocol.test.ts` proves
+both the forged-signature and wrong-merchant cases are rejected.
+
+### Interoperability caveat
+
+This matches the *shape* of Samourai's Soroban usage — a session addressed by the
+counterparty's payment code, encrypted via a BIP47-derived key rather than a published
+ephemeral one — but it is **not byte-compatible** with their `Bip47Encrypter` wire
+format, which could not be recovered from public sources. An unmodified
+Samourai/Ashigaru wallet therefore cannot yet pay this bot; reconciling the format is
+required before claiming that it can. The cipher is isolated behind
+`sealToPaymentCode` / `openWithIdentityKey` precisely so it can be swapped without
+disturbing anything above it.
 
 ## Module map
 
 | File | Role |
 |------|------|
-| `src/bip47.ts` | Derivation core: payment codes, notification address, `receiveAddress` / `sendAddress` / `receivePrivateKey`. Verified against the vectors. |
+| `src/bip47.ts` | Derivation core: payment codes, notification address, `receiveAddress` / `sendAddress` / `receivePrivateKey`. Verified against the official vectors, network-independent. |
 | `src/identity.ts` | `PaynymIdentity` — seed → account, payment code, identity signing. |
-| `src/soroban.ts` | Soroban JSON-RPC client, `encodeDirectory`, NaCl box channel, Ed25519 confidential auth. Matches the reference clients' wire format. |
-| `src/register.ts` | Notification-less registration protocol (sender + `Registrar`) and the sender `Registry`. |
+| `src/channel.ts` | Payment-code-derived channel encryption. No published keys. |
+| `src/soroban.ts` | Soroban JSON-RPC client, `encodeDirectory`, Ed25519 confidential auth. |
+| `src/register.ts` | Notification-less registration (customer + `Registrar`) and the customer registry. |
 | `src/watcher.ts` | Turns the registry into the gap-limited address set to watch, with a pluggable used-address oracle. |
-| `test/vectors.test.ts` | The BIP47 vector gate. |
-| `test/protocol.test.ts` | Offline end-to-end protocol test over an in-memory node. |
-| `example.ts` | One-shot live wiring against a real node. |
+| `src/state.ts` | Durable state, atomic writes, and the permanent network lock. |
+| `src/server.ts` | The onion-facing storefront. Exposes the PayNym and nothing else. |
+| `src/config.ts` | Paths and local service endpoints. |
+| `bin/paynym-bot.ts` | CLI: `init`, `serve`, `status`. |
+| `test/` | Vector gate, protocol, regressions, state, storefront. |
 
 ## Operating the receiver
 
-- **Your own indexer only.** Point `watcher`'s used-address oracle at your own
-  Bitcoin Core / electrs over Tor. The watch list is your counterparty graph —
-  never hand it to a public explorer.
-- **Back up the registry with the seed.** Receive keys cannot be re-derived from
-  the seed alone; they also need the registered sender payment codes
-  (`Registry.toJSON` / `fromJSON`).
-- **The bot is hot by construction** (ECDH needs the account private key). Keep
-  the float small and sweep to cold storage.
-- **testnet first:** `PaynymIdentity.fromSeed(seed, TESTNET)`, then flip to
-  `MAINNET`.
+- **Choose the network once.** `init` asks mainnet or testnet and records it. That choice
+  fixes the BIP47 derivation path and therefore the PayNym itself, so it cannot be
+  changed later without becoming a different receiver. Every command refuses loudly on a
+  mismatch.
+- **Back up the seed AND the state file.** Receive keys cannot be re-derived from the
+  seed alone: a BIP47 address depends on *both* parties' payment codes, so without the
+  registered customer codes in `state.json`, money already received cannot be found.
+- **Your own indexer only.** Point the used-address oracle at your Dojo's Fulcrum over
+  loopback. The watch list is your counterparty graph — never hand it to a public
+  explorer.
+- **The bot is hot by construction.** BIP47 receiving is ECDH with the receiver's private
+  key; there is no watch-only variant. It does not spend, which removes transaction
+  construction and signing from the codebase entirely, but anyone who extracts the
+  account key can derive the spend keys themselves. Keep the float small and sweep to
+  cold storage.
+- **The storefront exposes only the PayNym and the network.** Not the customer list, not
+  the watch addresses, not even a customer count — that set is your counterparty graph
+  and its size is your trading volume.
 
 ## Status
 
-- Derivation: verified against official vectors (0–9), both directions. ✅
-- Registration protocol: offline end-to-end incl. forgery rejection. ✅
-- Next: a persistent daemon loop (publish/poll/scan on timers) and the
-  Tor-SOCKS transport wiring sketched in `example.ts`.
+- Derivation: verified against the official vectors (0–9), both directions, on mainnet
+  and testnet. ✅
+- Registration: offline end-to-end, including forged-signature, wrong-merchant, and
+  attacker-writes-to-inbox cases. ✅
+- Storefront: serving the PayNym over loopback for Tor to publish. ✅
+- Init and durable state with a permanent network lock. ✅
+- Next: the used-address oracle against Fulcrum (so the bot can actually see a payment
+  arrive), then the daemon loop.
 
 ## Requirements
 
