@@ -21,6 +21,14 @@ paynym-bot status                   # network, PayNym, what is being watched
 paynym-bot serve                    # storefront only, no daemon
 ```
 
+`init` generates a **12-word BIP39 recovery phrase** and shows it once, or imports one you
+already have (`--mnemonic "…"`), so the bot can run on a PayNym you already own.
+
+> **Back up the phrase *and* `state.json`.** The phrase alone is not a complete backup. A
+> BIP47 receive address is a function of *both* parties' payment codes, so without the
+> registered customer codes in the state file, money already received cannot be found.
+> This is inherent to BIP47, not a choice made here.
+
 ## Why this works (and it isn't a hack)
 
 A BIP47 receive address is a pure function of the two parties' payment codes.
@@ -153,6 +161,7 @@ disturbing anything above it.
 | `src/soroban.ts` | Soroban JSON-RPC client, `encodeDirectory`, Ed25519 confidential auth. |
 | `src/register.ts` | Notification-less registration (customer + `Registrar`) and the customer registry. |
 | `src/watcher.ts` | Turns the registry into the gap-limited address set to watch, with a pluggable used-address oracle. |
+| `src/seed.ts` | BIP39 mnemonics: generate, import, and legacy hex seeds. |
 | `src/state.ts` | Durable state, atomic writes, and the permanent network lock. |
 | `src/server.ts` | The onion-facing storefront. Exposes the PayNym and nothing else. |
 | `src/config.ts` | Paths and local service endpoints. |
@@ -165,9 +174,14 @@ disturbing anything above it.
   fixes the BIP47 derivation path and therefore the PayNym itself, so it cannot be
   changed later without becoming a different receiver. Every command refuses loudly on a
   mismatch.
-- **Back up the seed AND the state file.** Receive keys cannot be re-derived from the
-  seed alone: a BIP47 address depends on *both* parties' payment codes, so without the
-  registered customer codes in `state.json`, money already received cannot be found.
+- **Back up the recovery phrase AND the state file.** Receive keys cannot be re-derived
+  from the seed alone: a BIP47 address depends on *both* parties' payment codes, so
+  without the registered customer codes in `state.json`, money already received cannot be
+  found.
+- **A BIP39 passphrase is for compatibility, not security.** On an always-online box it
+  must be supplied to the running service, so it sits beside the phrase and protects
+  nothing. It exists so an imported wallet derives the same PayNym it does in your wallet
+  app. Pass `--passphrase` on every command, or you get a different PayNym.
 - **Your own indexer only.** Point the used-address oracle at your Dojo's Fulcrum over
   loopback. The watch list is your counterparty graph — never hand it to a public
   explorer.

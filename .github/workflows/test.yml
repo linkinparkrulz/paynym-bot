@@ -17,5 +17,4 @@ jobs:
       - run: npm install
       - run: npm test
       # Type stripping does not type-check, so check explicitly.
-      - run: npx --yes typescript@5.9 tsc --noEmit --strict --module nodenext \
-          --target es2022 --allowImportingTsExtensions src/*.ts test/*.ts bin/*.ts example.ts
+      - run: npm run typecheck

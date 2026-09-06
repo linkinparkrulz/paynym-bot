@@ -9,20 +9,27 @@
     "vectors": "node --experimental-strip-types --no-warnings test/vectors.test.ts",
     "protocol": "node --experimental-strip-types --no-warnings test/protocol.test.ts",
     "regress": "node --experimental-strip-types --no-warnings test/register-fixes.test.ts",
-    "test": "npm run vectors && npm run protocol && npm run regress && npm run state && npm run server && npm run electrum && npm run daemon",
+    "test": "npm run vectors && npm run protocol && npm run regress && npm run state && npm run seed && npm run server && npm run electrum && npm run daemon",
     "state": "node --experimental-strip-types --no-warnings test/state.test.ts",
     "server": "node --experimental-strip-types --no-warnings test/server.test.ts",
     "electrum": "node --experimental-strip-types --no-warnings test/electrum.test.ts",
-    "daemon": "node --experimental-strip-types --no-warnings test/daemon.test.ts"
+    "daemon": "node --experimental-strip-types --no-warnings test/daemon.test.ts",
+    "seed": "node --experimental-strip-types --no-warnings test/seed.test.ts",
+    "typecheck": "tsc --noEmit --strict --module nodenext --target es2022 --allowImportingTsExtensions src/*.ts test/*.ts bin/*.ts example.ts"
   },
   "dependencies": {
     "@noble/curves": "^1.7.0",
     "@noble/hashes": "^1.6.0",
     "@scure/base": "^1.2.0",
     "@scure/bip32": "^1.6.0",
+    "@scure/bip39": "^2.4.0",
     "tweetnacl": "^1.0.3"
   },
   "bin": {
     "paynym-bot": "bin/paynym-bot.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.1",
+    "typescript": "5.9"
   }
 }
