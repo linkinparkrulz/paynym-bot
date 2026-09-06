@@ -38,12 +38,18 @@ export type PersistedState = {
   /** Chosen at init and never changed. See the note at the top of this file. */
   network: NetworkName
   createdAt: number
+  /** Optional shop name shown on the storefront above the payment code. */
+  label?: string
   /** Customers who have registered with us. Required to derive receive keys. */
   senders: SenderRecord[]
 }
 
-export function newState(network: NetworkName, now = Date.now()): PersistedState {
-  return { version: STATE_VERSION, network, createdAt: now, senders: [] }
+export function newState(
+  network: NetworkName,
+  now = Date.now(),
+  label?: string,
+): PersistedState {
+  return { version: STATE_VERSION, network, createdAt: now, label, senders: [] }
 }
 
 /** Parse and validate raw state JSON. Throws with an actionable message. */
@@ -66,6 +72,7 @@ export function parseState(raw: string): PersistedState {
     version: STATE_VERSION,
     network: s.network,
     createdAt: typeof s.createdAt === 'number' ? s.createdAt : 0,
+    label: typeof s.label === 'string' ? s.label : undefined,
     senders: s.senders as SenderRecord[],
   }
 }

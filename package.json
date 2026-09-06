@@ -9,8 +9,9 @@
     "vectors": "node --experimental-strip-types --no-warnings test/vectors.test.ts",
     "protocol": "node --experimental-strip-types --no-warnings test/protocol.test.ts",
     "regress": "node --experimental-strip-types --no-warnings test/register-fixes.test.ts",
-    "test": "npm run vectors && npm run protocol && npm run regress && npm run state",
-    "state": "node --experimental-strip-types --no-warnings test/state.test.ts"
+    "test": "npm run vectors && npm run protocol && npm run regress && npm run state && npm run server",
+    "state": "node --experimental-strip-types --no-warnings test/state.test.ts",
+    "server": "node --experimental-strip-types --no-warnings test/server.test.ts"
   },
   "dependencies": {
     "@noble/curves": "^1.7.0",

@@ -1,8 +1,9 @@
 #!/usr/bin/env -S node --experimental-strip-types --no-warnings
 // paynym-bot CLI.
 //
-//   paynym-bot init [--network mainnet|testnet] [--data <dir>] [--force]
+//   paynym-bot init [--network mainnet|testnet] [--label <name>] [--data <dir>] [--force]
 //   paynym-bot status [--data <dir>]
+//   paynym-bot serve [--data <dir>]
 //
 // init is the guided setup: it asks which network to run on, generates the
 // seed, and writes the state file. That network choice is permanent — see the
@@ -16,6 +17,7 @@ import { PaynymIdentity } from '../src/identity.ts'
 import { Registry } from '../src/register.ts'
 import { watchWindow } from '../src/watcher.ts'
 import { loadConfig } from '../src/config.ts'
+import { createStorefront } from '../src/server.ts'
 import {
   assertNetworkMatches,
   isNetworkName,
@@ -31,6 +33,7 @@ const { values, positionals } = parseArgs({
   options: {
     network: { type: 'string' },
     data: { type: 'string' },
+    label: { type: 'string' },
     force: { type: 'boolean', default: false },
   },
 })
@@ -96,7 +99,7 @@ async function init(): Promise<void> {
   writeFileSync(config.seedPath, `${seed.toString('hex')}\n`, { mode: 0o600 })
   chmodSync(config.seedPath, 0o600)
 
-  saveState(config.statePath, newState(network))
+  saveState(config.statePath, newState(network, Date.now(), values.label))
 
   const identity = PaynymIdentity.fromSeed(
     Uint8Array.from(seed),
@@ -138,11 +141,49 @@ function status(): void {
   console.log('')
 }
 
+function serve(): void {
+  const state = loadState(config.statePath)
+  if (isNetworkName(values.network)) assertNetworkMatches(state, values.network)
+
+  const identity = PaynymIdentity.fromSeed(
+    loadSeed(config.seedPath),
+    networkFor(state.network),
+  )
+  const server = createStorefront({
+    identity,
+    network: state.network,
+    label: values.label ?? state.label,
+  })
+
+  // Loopback only. Tor terminates the onion and forwards here; binding any
+  // wider would expose the storefront on the clearnet interface too.
+  server.listen(config.httpPort, '127.0.0.1', () => {
+    console.log(`\n  storefront:  http://127.0.0.1:${config.httpPort}`)
+    console.log(`  network:     ${state.network}`)
+    console.log(`  PayNym:      ${identity.paymentCode().slice(0, 24)}...\n`)
+    console.log('  Publish it by pointing a Tor hidden service at that port, e.g. in torrc:')
+    console.log('    HiddenServiceDir /var/lib/tor/paynym-bot/')
+    console.log(`    HiddenServicePort 80 127.0.0.1:${config.httpPort}\n`)
+    console.log('  Ctrl-C to stop.')
+  })
+
+  const shutdown = () => {
+    server.close(() => process.exit(0))
+    // Do not hang forever on a client holding the socket open.
+    setTimeout(() => process.exit(0), 3000).unref()
+  }
+  process.on('SIGINT', shutdown)
+  process.on('SIGTERM', shutdown)
+}
+
 try {
   if (command === 'init') await init()
   else if (command === 'status') status()
+  else if (command === 'serve') serve()
   else {
-    console.error('usage: paynym-bot <init|status> [--network mainnet|testnet] [--data <dir>]')
+    console.error(
+      'usage: paynym-bot <init|status|serve> [--network mainnet|testnet] [--label <name>] [--data <dir>]',
+    )
     process.exit(1)
   }
 } catch (err) {
