@@ -1,0 +1,64 @@
+# paynym-bot — always-online BIP47 receiver.
+#
+# Placeholders (__LIKE_THIS__) are filled in by scripts/install.mjs.
+
+[Unit]
+Description=paynym-bot — BIP47 receiver with no notification transaction
+Documentation=https://github.com/linkinparkrulz/paynym-bot
+After=network-online.target tor.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__SERVICE_USER__
+Group=__SERVICE_USER__
+WorkingDirectory=__INSTALL_ROOT__
+ExecStart=__NODE_BIN__ --experimental-strip-types --no-warnings __INSTALL_ROOT__/bin/paynym-bot.ts start
+Restart=on-failure
+RestartSec=5
+
+Environment=PAYNYM_BOT_DATA=__DATA_DIR__
+Environment=PAYNYM_BOT_SOROBAN=__SOROBAN_URL__
+Environment=PAYNYM_BOT_ELECTRUM_HOST=__ELECTRUM_HOST__
+Environment=PAYNYM_BOT_ELECTRUM_PORT=__ELECTRUM_PORT__
+Environment=PAYNYM_BOT_HTTP_PORT=__HTTP_PORT__
+
+# --- Hardening -------------------------------------------------------------
+# This process holds a hot BIP47 account key by construction: BIP47 receiving is
+# ECDH with the receiver's private key and has no watch-only variant. It never
+# spends, so there is no signing path to abuse, but anyone who reads the key can
+# derive the spend keys themselves. Treat the blast radius as the float.
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @obsolete
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0077
+
+# The data directory is the ONLY writable path: it holds the recovery phrase and
+# the customer payment codes, both of which are needed to find received funds.
+ReadWritePaths=__DATA_DIR__
+
+# Deliberately NOT set: MemoryDenyWriteExecute=yes. V8 needs writable-executable
+# pages for its JIT, so it would stop the service from starting at all. Do not
+# add it back without also passing --jitless, which costs real throughput.
+
+[Install]
+WantedBy=multi-user.target
