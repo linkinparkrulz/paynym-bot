@@ -1,0 +1,131 @@
+// State, network locking, and the init-time network choice.
+//
+// The network is chosen once at init and recorded in the state file. It fixes
+// the BIP47 derivation path and therefore the merchant's own payment code, so
+// running the same seed against a different network is a DIFFERENT receiver.
+// These tests pin that: the choice takes effect, and a mismatch is refused
+// loudly rather than silently presenting another PayNym.
+
+import { mkdtempSync, existsSync, statSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { PaynymIdentity } from '../src/identity.ts'
+import {
+  STATE_VERSION,
+  assertNetworkMatches,
+  isNetworkName,
+  loadState,
+  networkFor,
+  newState,
+  parseState,
+  saveState,
+} from '../src/state.ts'
+
+let failures = 0
+function assert(name: string, cond: boolean): void {
+  if (!cond) failures++
+  console.log(`${cond ? 'ok  ' : 'FAIL'}  ${name}`)
+}
+function throws(name: string, fn: () => unknown, expect?: string): void {
+  try {
+    fn()
+    assert(name, false)
+  } catch (e) {
+    const msg = (e as Error).message
+    assert(name, expect ? msg.includes(expect) : true)
+  }
+}
+
+const dir = mkdtempSync(join(tmpdir(), 'paynym-state-'))
+
+// --- network name guard -----------------------------------------------------
+assert('isNetworkName accepts mainnet', isNetworkName('mainnet'))
+assert('isNetworkName accepts testnet', isNetworkName('testnet'))
+assert('isNetworkName rejects regtest', !isNetworkName('regtest'))
+assert('isNetworkName rejects undefined', !isNetworkName(undefined))
+
+// --- parse validation -------------------------------------------------------
+throws('parseState rejects non-JSON', () => parseState('{not json'), 'not valid JSON')
+throws(
+  'parseState rejects a future version',
+  () => parseState(JSON.stringify({ version: 99, network: 'testnet', senders: [] })),
+  'unsupported state version',
+)
+throws(
+  'parseState rejects an unknown network',
+  () => parseState(JSON.stringify({ version: STATE_VERSION, network: 'regtest', senders: [] })),
+  'invalid network',
+)
+throws(
+  'parseState rejects missing senders',
+  () => parseState(JSON.stringify({ version: STATE_VERSION, network: 'testnet' })),
+  'no senders array',
+)
+
+// --- round trip and atomic write -------------------------------------------
+const statePath = join(dir, 'state.json')
+const state = newState('testnet', 1234)
+state.senders.push({ paymentCode: 'PM8TEST', firstSeen: 1, nextIndex: 0 })
+saveState(statePath, state)
+
+const reloaded = loadState(statePath)
+assert('state round-trips the network', reloaded.network === 'testnet')
+assert('state round-trips senders', reloaded.senders.length === 1)
+assert('state round-trips createdAt', reloaded.createdAt === 1234)
+assert('no temp file is left behind', !existsSync(`${statePath}.tmp`))
+assert('state file is owner-only', (statSync(statePath).mode & 0o077) === 0)
+
+throws(
+  'loadState explains a missing file',
+  () => loadState(join(dir, 'absent.json')),
+  'run "paynym-bot init"',
+)
+
+// --- the network lock -------------------------------------------------------
+assertNetworkMatches(reloaded, 'testnet')
+assert('matching network is accepted', true)
+throws(
+  'mismatched network is refused',
+  () => assertNetworkMatches(reloaded, 'mainnet'),
+  'network mismatch',
+)
+throws(
+  'the refusal names the stored network',
+  () => assertNetworkMatches(reloaded, 'mainnet'),
+  'created for testnet',
+)
+
+// --- the choice actually changes the receiver -------------------------------
+// Same seed, different network: different derivation path, different PayNym.
+// This is why the choice cannot be revisited after customers register.
+const seed = Uint8Array.from(Buffer.from('11'.repeat(64), 'hex'))
+const onTestnet = PaynymIdentity.fromSeed(seed, networkFor('testnet'))
+const onMainnet = PaynymIdentity.fromSeed(seed, networkFor('mainnet'))
+
+assert('same seed yields a different PayNym per network', onTestnet.paymentCode() !== onMainnet.paymentCode())
+const tAddr = onTestnet.notificationAddress()
+const mAddr = onMainnet.notificationAddress()
+assert('testnet identity encodes testnet addresses', tAddr[0] === 'm' || tAddr[0] === 'n')
+assert('mainnet identity encodes mainnet addresses', mAddr[0] === '1')
+
+// A testnet receiver's watch addresses are testnet too, all the way through.
+const peer = PaynymIdentity.fromSeed(
+  Uint8Array.from(Buffer.from('22'.repeat(64), 'hex')),
+  networkFor('testnet'),
+)
+const recv = onTestnet.receiveAddress(peer.paymentCode(), 0)
+assert('testnet receive address encodes testnet', recv[0] === 'm' || recv[0] === 'n')
+assert(
+  'testnet sender agrees on the address',
+  peer.sendAddress(onTestnet.paymentCode(), 0) === recv,
+)
+
+rmSync(dir, { recursive: true, force: true })
+
+console.log('')
+if (failures === 0) {
+  console.log('PASS — state, network lock, and init-time network choice.')
+} else {
+  console.log(`FAIL — ${failures} state check(s) failed.`)
+  process.exit(1)
+}
