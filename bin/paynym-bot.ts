@@ -13,7 +13,7 @@
 // note in src/state.ts.
 
 import { parseArgs } from 'node:util'
-import { existsSync, mkdirSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync } from 'node:fs'
 import { createInterface } from 'node:readline/promises'
 import { PaynymIdentity } from '../src/identity.ts'
 import { Registrar, Registry } from '../src/register.ts'
@@ -96,8 +96,13 @@ async function promptNetwork(): Promise<NetworkName> {
 }
 
 function loadSeed(path: string): Uint8Array {
+  // The installer stores a passphrase beside the phrase at 0600 rather than in
+  // the unit file, which is world-readable by default.
+  const stored = existsSync(config.passphrasePath)
+    ? readFileSync(config.passphrasePath, 'utf8').trim()
+    : ''
   try {
-    return readSeedFile(path, values.passphrase ?? '').seed
+    return readSeedFile(path, values.passphrase ?? stored).seed
   } catch (err) {
     return die((err as Error).message)
   }

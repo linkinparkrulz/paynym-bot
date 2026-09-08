@@ -16,12 +16,31 @@ import {
   FULCRUM_PORT,
   SOROBAN_PORT,
   candidatesFor,
+  explicitCandidate,
   probeElectrum,
   probeSoroban,
   remedyFor,
   sorobanUrlFor,
 } from '../src/discover.ts'
+import {
+  DEFAULT_ELECTRUM_PORT,
+  assertIndexerAllowed,
+  isOnion,
+  nodeIsReachableByService,
+  normaliseSorobanUrl,
+  parseElectrumEndpoint,
+} from '../src/config.ts'
+import { DEFAULT_TOR_SOCKS_HOST, DEFAULT_TOR_SOCKS_PORT } from '../src/socks.ts'
 import type { NetworkName } from '../src/state.ts'
+
+const TOR_SOCKS = { host: DEFAULT_TOR_SOCKS_HOST, port: DEFAULT_TOR_SOCKS_PORT }
+
+/** Value of `--flag x`, or undefined. */
+function flag(name: string): string | undefined {
+  const i = process.argv.indexOf(`--${name}`)
+  return i >= 0 ? process.argv[i + 1] : undefined
+}
+
 
 const DRY = process.argv.includes('--dry-run')
 
@@ -95,7 +114,19 @@ try {
   }
   const major = Number(process.versions.node.split('.')[0])
   if (major < 22) die(`Node 22+ required, found ${process.versions.node}`)
-  info(`node ${process.versions.node} at ${process.execPath}`)
+
+  const nodeBin = flag('node-bin') ?? process.execPath
+  info(`node ${process.versions.node} at ${nodeBin}`)
+  if (!nodeIsReachableByService(nodeBin)) {
+    die(
+      `${nodeBin} sits under a home directory, and the service runs with\n` +
+        `   ProtectHome=yes, so it could never execute that path.\n\n` +
+        `   Install a system-wide Node — the README has the NodeSource commands,\n` +
+        `   which put it in /usr/bin — or point at one you already have:\n` +
+        `     ./install.sh --node-bin /usr/bin/node\n\n` +
+        `   Weakening the sandbox is not the answer: this process holds a hot key.`,
+    )
+  }
 
   if (!has('tor')) {
     warn('tor is not installed — the storefront cannot be published without it')
@@ -161,8 +192,27 @@ try {
     mnemonic = newMnemonic()
     generated = true
   }
-  const seed = seedFromMnemonic(mnemonic)
+  // A passphrase changes the wallet entirely. It adds no security here — it
+  // must sit beside the phrase for the service to start — but an imported
+  // wallet created with one derives a different PayNym without it, and the
+  // operator would only discover that when payments never arrived.
+  let passphrase = flag('passphrase') ?? ''
+  if (!generated && passphrase.length === 0 && !DRY) {
+    if (await confirm('does that phrase use a BIP39 passphrase?')) {
+      passphrase = await ask('passphrase: ')
+    }
+  }
+  const seed = seedFromMnemonic(mnemonic, passphrase)
   const identity = PaynymIdentity.fromSeed(seed, networkFor(network))
+
+  if (!generated) {
+    // The cheapest guard against silently installing the wrong wallet.
+    info('')
+    info(`This phrase derives: ${identity.paymentCode()}`)
+    if (!DRY && !(await confirm('does that match the PayNym you expect?'))) {
+      die('stopping: check the phrase, and the passphrase if the wallet uses one')
+    }
+  }
 
   if (generated) {
     const words = mnemonic.split(' ')
@@ -185,13 +235,54 @@ try {
 
   // --- 5. Find the Dojo -----------------------------------------------------
   heading('Dojo services')
-  const electrum = await probeElectrum(await candidatesFor('fulcrum', FULCRUM_PORT))
+
+  // Two shapes, and they can be mixed. A remote testnet indexer with a local
+  // Soroban is how an operator whose only Dojo is mainnet rehearses on testnet.
+  const remote = await confirm('is your Dojo remote, published as onion services?')
+  let electrumCandidates
+  let sorobanCandidates
+  if (remote) {
+    info('Dojo Bay lists these; paste them exactly as shown.')
+    let parsed
+    for (;;) {
+      try {
+        parsed = parseElectrumEndpoint(
+          await ask(`indexer (tcp://…onion:${DEFAULT_ELECTRUM_PORT}): `),
+          DEFAULT_ELECTRUM_PORT,
+        )
+        break
+      } catch (err) {
+        warn((err as Error).message)
+      }
+    }
+    let sorobanUrlInput
+    for (;;) {
+      try {
+        sorobanUrlInput = new URL(normaliseSorobanUrl(await ask('soroban rpc (…onion): ')))
+        break
+      } catch (err) {
+        warn((err as Error).message)
+      }
+    }
+    electrumCandidates = explicitCandidate(parsed.host, parsed.port, TOR_SOCKS)
+    sorobanCandidates = explicitCandidate(
+      sorobanUrlInput.hostname,
+      Number(sorobanUrlInput.port || 80),
+      TOR_SOCKS,
+    )
+    info('reaching these over Tor; a circuit takes a few seconds to build.')
+  } else {
+    electrumCandidates = await candidatesFor('fulcrum', FULCRUM_PORT)
+    sorobanCandidates = await candidatesFor('soroban', SOROBAN_PORT)
+  }
+
+  const electrum = await probeElectrum(electrumCandidates)
   for (const a of electrum.attempts) {
     info(`${a.error ? '·' : '✓'} ${a.candidate.host}:${a.candidate.port}  ${a.candidate.why}`)
   }
   if (!electrum.found) {
     console.log('')
-    for (const line of remedyFor('indexer').split('\n')) info(line)
+    for (const line of remedyFor('indexer', remote).split('\n')) info(line)
     if (!DRY) {
       die('cannot install: without an indexer the receiver can never notice a payment')
     }
@@ -200,15 +291,27 @@ try {
   const indexer = electrum.found ?? { host: '<none>', port: FULCRUM_PORT, why: 'not found' }
   info(`indexer: ${indexer.host}:${indexer.port}`)
 
-  const soroban = await probeSoroban(await candidatesFor('soroban', SOROBAN_PORT))
+  const soroban = await probeSoroban(sorobanCandidates)
   if (!soroban.found) {
     console.log('')
-    for (const line of remedyFor('soroban').split('\n')) info(line)
+    for (const line of remedyFor('soroban', remote).split('\n')) info(line)
     if (!DRY) die('cannot install: without Soroban no customer can register')
     warn('a real run would STOP here: no Soroban means no customer can register')
   }
   const sorobanUrl = soroban.found ? sorobanUrlFor(soroban.found) : '<none>'
   info(`soroban: ${sorobanUrl}`)
+
+  // Refuse before touching the system: on mainnet an indexer the operator does
+  // not control would learn the entire customer list.
+  try {
+    assertIndexerAllowed(network, indexer.host, process.env.PAYNYM_BOT_ALLOW_REMOTE_INDEXER === 'yes')
+  } catch (err) {
+    die((err as Error).message)
+  }
+  if (isOnion(indexer.host)) {
+    warn('the indexer is remote, so its operator sees every address this bot watches.')
+    warn('acceptable for a testnet rehearsal; never for mainnet.')
+  }
 
   // --- 6. Service account and files ----------------------------------------
   heading('Install')
@@ -251,7 +354,14 @@ try {
   act('write the wallet and initial state', () => {
     writeFileSync(join(dataDir, 'seed'), `${mnemonic}\n`, { mode: 0o600 })
     saveState(join(dataDir, 'state.json'), newState(network, Date.now(), label || undefined))
-    sh('chown', [`${SERVICE_USER}:${SERVICE_USER}`, join(dataDir, 'seed'), join(dataDir, 'state.json')])
+    const written = [join(dataDir, 'seed'), join(dataDir, 'state.json')]
+    if (passphrase.length > 0) {
+      // 0600 beside the phrase, NOT in the unit file: units are world-readable
+      // by default, and the phrase itself is not.
+      writeFileSync(join(dataDir, 'passphrase'), `${passphrase}\n`, { mode: 0o600 })
+      written.push(join(dataDir, 'passphrase'))
+    }
+    sh('chown', [`${SERVICE_USER}:${SERVICE_USER}`, ...written])
   })
 
   // --- 7. Tor ---------------------------------------------------------------
@@ -296,7 +406,7 @@ try {
   const unit = readFileSync(join(REPO, 'scripts', 'paynym-bot.service'), 'utf8')
     .replaceAll('__SERVICE_USER__', SERVICE_USER)
     .replaceAll('__INSTALL_ROOT__', root)
-    .replaceAll('__NODE_BIN__', process.execPath)
+    .replaceAll('__NODE_BIN__', flag('node-bin') ?? process.execPath)
     .replaceAll('__DATA_DIR__', dataDir)
     .replaceAll('__SOROBAN_URL__', sorobanUrl)
     .replaceAll('__ELECTRUM_HOST__', indexer.host)

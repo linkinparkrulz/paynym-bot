@@ -25,6 +25,8 @@ export type Config = {
   dataDir: string
   statePath: string
   seedPath: string
+  /** Optional BIP39 passphrase, stored 0600 beside the phrase. */
+  passphrasePath: string
   /** Soroban JSON-RPC endpoint, already normalised to a full URL. */
   sorobanUrl: string
   electrumHost: string
@@ -93,6 +95,19 @@ export function normaliseSorobanUrl(value: string): string {
   return url.toString()
 }
 
+/**
+ * Can the hardened service actually execute this Node?
+ *
+ * The unit sets ProtectHome=yes, which makes /home, /root and /run/user
+ * invisible to it, so a Node installed by nvm or into ~/.local yields an
+ * ExecStart that could never run — failing at start with an unhelpful error.
+ * install.sh deliberately resolves the invoking user's Node before escalating,
+ * which is exactly the case that breaks, so this has to be checked explicitly.
+ */
+export function nodeIsReachableByService(execPath: string): boolean {
+  return !/^\/(home|root|run\/user)(\/|$)/.test(execPath)
+}
+
 /** The proxy needed to reach `host`, or undefined when it is directly routable. */
 export function proxyFor(host: string, config: Config): SocksProxy | undefined {
   return isOnion(host) ? config.torSocks : undefined
@@ -132,6 +147,7 @@ export function loadConfig(overrides: { dataDir?: string } = {}): Config {
     dataDir,
     statePath: join(dataDir, 'state.json'),
     seedPath: join(dataDir, 'seed'),
+    passphrasePath: join(dataDir, 'passphrase'),
     sorobanUrl: normaliseSorobanUrl(env('PAYNYM_BOT_SOROBAN') ?? 'http://127.0.0.1:4242/rpc'),
     electrumHost: electrum.host,
     electrumPort: electrum.port,

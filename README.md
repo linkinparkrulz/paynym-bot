@@ -34,6 +34,28 @@ It **stops before installing anything** if it cannot reach your Dojo, and tells 
 to fix it — a receiver that cannot see the chain can never notice a payment. Re-run that
 diagnosis any time with `paynym-bot doctor`.
 
+### Rehearsing on testnet against someone else's Dojo
+
+If your own Dojo is mainnet, there is nowhere local to rehearse. A remote testnet Dojo
+works instead: Dojo publishes its indexer and Soroban as onion services, and Dojo Bay
+lists them.
+
+```bash
+export PAYNYM_BOT_ELECTRUM="tcp://<indexer>.onion:50001"
+export PAYNYM_BOT_SOROBAN="<soroban>.onion"     # normalised to http://…/rpc
+paynym-bot doctor                                # confirm both answer over Tor
+```
+
+The installer asks whether your Dojo is remote and prompts for the same two values.
+Anything ending in `.onion` is routed through Tor's SOCKS proxy automatically
+(`127.0.0.1:9050` by default; override with `PAYNYM_BOT_TOR_SOCKS_HOST` / `_PORT`).
+
+> **This is refused on mainnet, deliberately.** Every address the bot watches is queried
+> against the indexer, so a remote one hands its operator your entire customer list — the
+> exact linkage that skipping the notification transaction is meant to avoid. Harmless on
+> testnet, where there are no real counterparties. Your own Dojo, on loopback or a private
+> network, is always allowed.
+
 Removal is a dry run unless you ask for it:
 
 ```bash
@@ -202,7 +224,8 @@ choice they are making** before they pay.
 | `src/seed.ts` | BIP39 mnemonics: generate, import, and legacy hex seeds. |
 | `src/state.ts` | Durable state, atomic writes, and the permanent network lock. |
 | `src/server.ts` | The onion-facing storefront. Exposes the PayNym and nothing else. |
-| `src/config.ts` | Paths and local service endpoints. |
+| `src/config.ts` | Paths, endpoints, and the deployment rules (Tor routing, the mainnet indexer guard). |
+| `src/socks.ts` | SOCKS5, so a Dojo published as an onion can be reached. |
 | `src/discover.ts` | Finds the Dojo's indexer and Soroban, proven by protocol not open ports. |
 | `src/torrc.ts` | Merges our hidden service into a shared torrc, reversibly. |
 | `bin/paynym-bot.ts` | CLI: `init`, `start`, `serve`, `status`, `doctor`. |
