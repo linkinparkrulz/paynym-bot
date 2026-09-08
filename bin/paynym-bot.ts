@@ -25,6 +25,7 @@ import {
   FULCRUM_PORT,
   SOROBAN_PORT,
   candidatesFor,
+  explicitCandidate,
   probeElectrum,
   probeSoroban,
   remedyFor,
@@ -38,7 +39,7 @@ import {
   seedFromMnemonic,
   writeMnemonicFile,
 } from '../src/seed.ts'
-import { loadConfig } from '../src/config.ts'
+import { assertIndexerAllowed, isOnion, loadConfig, proxyFor } from '../src/config.ts'
 import { createStorefront } from '../src/server.ts'
 import {
   assertNetworkMatches,
@@ -286,10 +287,22 @@ function start(): void {
   const registry = Registry.fromJSON(state.senders)
   const registrar = new Registrar(identity, registry)
 
-  const rpc = SorobanRPC.forUrl(config.sorobanUrl)
+  // Refuse before anything starts: on mainnet, an indexer the operator does not
+  // control would learn the whole customer list.
+  try {
+    assertIndexerAllowed(state.network, config.electrumHost, config.allowRemoteIndexerOnMainnet)
+  } catch (err) {
+    die((err as Error).message)
+  }
+
+  const sorobanHost = new URL(config.sorobanUrl).hostname
+  const rpc = SorobanRPC.forUrl(config.sorobanUrl, proxyFor(sorobanHost, config))
   const electrum = new ElectrumClient({
     host: config.electrumHost,
     port: config.electrumPort,
+    proxy: proxyFor(config.electrumHost, config),
+    // A Tor circuit takes seconds to build, where loopback takes none.
+    timeoutMs: isOnion(config.electrumHost) ? 30_000 : 10_000,
   })
 
   const daemon = new Daemon({
@@ -315,8 +328,11 @@ function start(): void {
     console.log(`\n  network:     ${state.network}`)
     console.log(`  PayNym:      ${identity.paymentCode()}`)
     console.log(`  storefront:  http://127.0.0.1:${config.httpPort}`)
-    console.log(`  soroban:     ${config.sorobanUrl}`)
-    console.log(`  indexer:     ${config.electrumHost}:${config.electrumPort}`)
+    console.log(`  soroban:     ${config.sorobanUrl}${isOnion(sorobanHost) ? '  (via Tor)' : ''}`)
+    console.log(
+      `  indexer:     ${config.electrumHost}:${config.electrumPort}` +
+        `${isOnion(config.electrumHost) ? '  (via Tor)' : ''}`,
+    )
     console.log(`  customers:   ${state.senders.length}\n`)
     daemon.start()
   })
@@ -343,7 +359,15 @@ async function doctor(): Promise<void> {
     ['indexer (Fulcrum)', 'fulcrum', FULCRUM_PORT],
     ['soroban', 'soroban', SOROBAN_PORT],
   ] as const) {
-    const candidates = await candidatesFor(container, port)
+    // An explicitly configured onion is checked as given; only an unconfigured
+    // endpoint gets the local discovery sweep.
+    const configuredHost =
+      container === 'fulcrum' ? config.electrumHost : new URL(config.sorobanUrl).hostname
+    const configuredPort =
+      container === 'fulcrum' ? config.electrumPort : Number(new URL(config.sorobanUrl).port || 80)
+    const candidates = isOnion(configuredHost)
+      ? explicitCandidate(configuredHost, configuredPort, config.torSocks)
+      : await candidatesFor(container, port)
     const result =
       container === 'fulcrum' ? await probeElectrum(candidates) : await probeSoroban(candidates)
 
@@ -360,7 +384,8 @@ async function doctor(): Promise<void> {
     } else {
       ok = false
       console.log('')
-      for (const line of remedyFor(container === 'fulcrum' ? 'indexer' : 'soroban').split('\n')) {
+      const viaTor = isOnion(configuredHost)
+      for (const line of remedyFor(container === 'fulcrum' ? 'indexer' : 'soroban', viaTor).split('\n')) {
         console.log(`    ${line}`)
       }
     }
