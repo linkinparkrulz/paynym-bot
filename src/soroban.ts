@@ -17,8 +17,11 @@
 //     Payment-code authenticity must be established at the application layer
 //     (see register.ts).
 
+import { request as httpRequest } from 'node:http'
 import nacl from 'tweetnacl'
 import { sha256 } from '@noble/hashes/sha256'
+import { socksConnect } from './socks.ts'
+import type { SocksProxy } from './socks.ts'
 
 export type Mode = 'fast' | 'short' | 'default' | 'normal' | 'long'
 
@@ -41,6 +44,69 @@ export function encodeDirectory(name: string): string {
  * a Tor SOCKS proxy (e.g. undici + socks-proxy-agent) or to test offline.
  */
 export type RpcTransport = (payload: unknown) => Promise<any>
+
+/**
+ * Transport for a Soroban published as an onion service. Node's fetch (undici)
+ * cannot speak SOCKS, so this drops to node:http and supplies the tunnelled
+ * socket via createConnection. Soroban's hidden service is plain HTTP on port
+ * 80 — Tor is the transport security — so there is no TLS to arrange.
+ */
+export function socksTransport(
+  url: string,
+  proxy: SocksProxy,
+  timeoutMs = 30_000,
+): RpcTransport {
+  const target = new URL(url)
+  const port = Number(target.port || 80)
+
+  return (payload: unknown) =>
+    new Promise((resolve, reject) => {
+      const body = JSON.stringify(payload)
+      const req = httpRequest(
+        {
+          host: target.hostname,
+          port,
+          path: `${target.pathname}${target.search}`,
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            'content-length': Buffer.byteLength(body),
+            'user-agent': 'HotJava/1.1.2 FCS',
+          },
+          createConnection: ((_opts: unknown, cb: (e: Error | null, s?: unknown) => void) => {
+            socksConnect(proxy, target.hostname, port, timeoutMs).then(
+              (socket) => cb(null, socket),
+              (err: Error) => cb(err),
+            )
+            // Returning nothing is valid when the callback form is used.
+            return undefined
+          }) as never,
+        },
+        (res) => {
+          if (res.statusCode !== undefined && res.statusCode >= 400) {
+            res.resume()
+            reject(new Error(`Soroban RPC HTTP ${res.statusCode}`))
+            return
+          }
+          let text = ''
+          res.setEncoding('utf8')
+          res.on('data', (c: string) => (text += c))
+          res.on('end', () => {
+            try {
+              resolve(JSON.parse(text))
+            } catch {
+              reject(new Error('Soroban RPC returned invalid JSON'))
+            }
+          })
+        },
+      )
+      // Same reasoning as the fetch path: a stalled node must not wedge a tick
+      // forever, since the daemon skips a tick whose predecessor is running.
+      req.setTimeout(timeoutMs, () => req.destroy(new Error('Soroban RPC timed out')))
+      req.on('error', reject)
+      req.end(body)
+    })
+}
 
 export function fetchTransport(url: string, timeoutMs = 15_000): RpcTransport {
   return async (payload: unknown) => {
@@ -86,8 +152,9 @@ export class SorobanRPC {
     this.transport = transport
   }
 
-  static forUrl(url: string): SorobanRPC {
-    return new SorobanRPC(fetchTransport(url))
+  /** Over Tor when `proxy` is given (an onion Dojo), directly otherwise. */
+  static forUrl(url: string, proxy?: SocksProxy): SorobanRPC {
+    return new SorobanRPC(proxy ? socksTransport(url, proxy) : fetchTransport(url))
   }
 
   private async call(method: string, args: Record<string, unknown>): Promise<any> {

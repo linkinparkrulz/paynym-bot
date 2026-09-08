@@ -18,6 +18,8 @@ import { sha256 } from '@noble/hashes/sha256'
 import { base58check as base58checkFactory } from '@scure/base'
 import type { Network } from './bip47.ts'
 import type { UsedChecker } from './watcher.ts'
+import { socksConnect } from './socks.ts'
+import type { SocksProxy } from './socks.ts'
 
 const base58check = base58checkFactory(sha256)
 
@@ -49,6 +51,11 @@ export type ElectrumOptions = {
   port: number
   /** Per-request timeout. A hung indexer must not wedge the scan loop. */
   timeoutMs?: number
+  /**
+   * Route through a SOCKS5 proxy (Tor). Required to reach a Dojo published as
+   * an onion service; omit it for a Dojo on the same host.
+   */
+  proxy?: SocksProxy
 }
 
 /**
@@ -94,48 +101,61 @@ export class ElectrumClient {
     else p.resolve(msg.result)
   }
 
+  /** Wire up a connected socket. Identical whether it came via Tor or not. */
+  private attach(socket: Socket): void {
+    socket.setEncoding('utf8')
+    socket.setKeepAlive(true, 30_000)
+    this.socket = socket
+
+    socket.on('error', (err) => {
+      this.socket = null
+      this.failAll(err)
+    })
+    socket.on('close', () => {
+      this.socket = null
+      this.failAll(new Error('electrum connection closed'))
+    })
+    socket.on('data', (chunk: string) => {
+      this.buffer += chunk
+      let nl: number
+      while ((nl = this.buffer.indexOf('\n')) >= 0) {
+        const line = this.buffer.slice(0, nl)
+        this.buffer = this.buffer.slice(nl + 1)
+        this.handleLine(line)
+      }
+    })
+  }
+
   private async ensureConnected(): Promise<Socket> {
     if (this.socket && !this.socket.destroyed) return this.socket
     if (this.connecting) return this.connecting
 
-    this.connecting = new Promise<Socket>((resolve, reject) => {
-      const socket = connect({ host: this.opts.host, port: this.opts.port })
-      socket.setEncoding('utf8')
-      socket.setKeepAlive(true, 30_000)
+    // A SOCKS tunnel is transparent once established, so everything above this
+    // point — the line protocol, the pending map — is identical either way.
+    const open = this.opts.proxy
+      ? socksConnect(this.opts.proxy, this.opts.host, this.opts.port, this.timeoutMs)
+      : new Promise<Socket>((resolve, reject) => {
+          const socket = connect({ host: this.opts.host, port: this.opts.port })
+          const onError = (err: Error) => reject(err)
+          socket.once('error', onError)
+          socket.once('connect', () => {
+            socket.removeListener('error', onError)
+            resolve(socket)
+          })
+        })
 
-      const onFailure = (err: Error) => {
+    this.connecting = open
+      .then((socket) => {
+        this.connecting = null
+        this.attach(socket)
+        return socket
+      })
+      .catch((err: Error) => {
         this.socket = null
         this.connecting = null
         this.failAll(err)
-        reject(err)
-      }
-
-      socket.once('connect', () => {
-        this.socket = socket
-        this.connecting = null
-        socket.removeListener('error', onFailure)
-        socket.on('error', (err) => {
-          this.socket = null
-          this.failAll(err)
-        })
-        socket.on('close', () => {
-          this.socket = null
-          this.failAll(new Error('electrum connection closed'))
-        })
-        resolve(socket)
+        throw err
       })
-      socket.once('error', onFailure)
-
-      socket.on('data', (chunk: string) => {
-        this.buffer += chunk
-        let nl: number
-        while ((nl = this.buffer.indexOf('\n')) >= 0) {
-          const line = this.buffer.slice(0, nl)
-          this.buffer = this.buffer.slice(nl + 1)
-          this.handleLine(line)
-        }
-      })
-    })
     return this.connecting
   }
 
