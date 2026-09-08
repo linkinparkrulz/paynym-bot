@@ -171,16 +171,22 @@ submitted code. The signed message names **both** parties, so an envelope addres
 one merchant cannot be replayed into another's inbox. `test/protocol.test.ts` proves
 both the forged-signature and wrong-merchant cases are rejected.
 
-### Interoperability caveat
+### Stock wallets: compatible, with a disclosed cost
 
-This matches the *shape* of Samourai's Soroban usage — a session addressed by the
-counterparty's payment code, encrypted via a BIP47-derived key rather than a published
-ephemeral one — but it is **not byte-compatible** with their `Bip47Encrypter` wire
-format, which could not be recovered from public sources. An unmodified
-Samourai/Ashigaru wallet therefore cannot yet pay this bot; reconciling the format is
-required before claiming that it can. The cipher is isolated behind
-`sealToPaymentCode` / `openWithIdentityKey` precisely so it can be swapped without
-disturbing anything above it.
+The bot also speaks Samourai's own Soroban wire format, so an unmodified
+Samourai/Ashigaru wallet can reach it. The format was recovered from their source and
+verified byte-for-byte against their compiled Java — see
+[docs/samourai-wire-format.md](docs/samourai-wire-format.md).
+
+**It is not the default, for a reason.** Their envelope carries the sender's payment code
+in cleartext, which is unavoidable given its static-static ECDH: the receiver must know
+which partner key to use before it can decrypt. For Cahoots between parties already linked
+on-chain that leaks nothing. For a merchant it publishes the entire customer list to
+anyone who can read the PayNym and list the directory — the very linkage the notification
+transaction blinds.
+
+So the bot accepts both, prefers its own, and **the storefront tells the customer which
+choice they are making** before they pay.
 
 ## Module map
 
@@ -188,7 +194,8 @@ disturbing anything above it.
 |------|------|
 | `src/bip47.ts` | Derivation core: payment codes, notification address, `receiveAddress` / `sendAddress` / `receivePrivateKey`. Verified against the official vectors, network-independent. |
 | `src/identity.ts` | `PaynymIdentity` — seed → account, payment code, identity signing. |
-| `src/channel.ts` | Payment-code-derived channel encryption. No published keys. |
+| `src/channel.ts` | Our channel encryption: ephemeral key, payment code stays confidential. |
+| `src/samourai.ts` | Samourai's wire format, for stock-wallet compatibility. |
 | `src/soroban.ts` | Soroban JSON-RPC client, `encodeDirectory`, Ed25519 confidential auth. |
 | `src/register.ts` | Notification-less registration (customer + `Registrar`) and the customer registry. |
 | `src/watcher.ts` | Turns the registry into the gap-limited address set to watch, with a pluggable used-address oracle. |
@@ -247,8 +254,8 @@ disturbing anything above it.
   register from a wallet, send a payment, watch it credited with no notification
   transaction on chain. Everything above is exercised offline; that run is what proves
   it against a real chain.
-- Also outstanding: byte-compatibility with Samourai's `Bip47Encrypter` (see above), a
-  QR on the storefront, and sender-side index persistence.
+- Samourai wire-format compatibility, verified against their compiled Java. ✅
+- Also outstanding: a QR on the storefront, and sender-side index persistence.
 
 ## Requirements
 

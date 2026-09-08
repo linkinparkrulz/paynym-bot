@@ -40,6 +40,10 @@
   .how ol { margin: 10px 0 0; padding-left: 20px; }
   .how li { margin: 5px 0; }
   .how strong { color: var(--ink); font-weight: 600; }
+  .how.note { border-left: 2px solid var(--warn); padding-left: 14px; }
+  .how.note ul { margin: 10px 0 0; padding-left: 20px; }
+  .how.note li { margin: 7px 0; }
+  .how.note p { margin: 8px 0 0; }
   footer { margin-top: 22px; color: var(--muted); font-size: 12.5px; }
   .err { color: var(--warn); }
   [hidden] { display: none !important; }
@@ -67,6 +71,25 @@
       <li>Your wallet and this receiver agree on a fresh address privately, off-chain.</li>
       <li>You send one ordinary payment. Nothing marks the connection on-chain.</li>
     </ol>
+  </div>
+
+  <div class="how note" id="privacy" hidden>
+    <strong>Before you pay: which wallet you use changes what is public</strong>
+    <p>
+      Nothing about your payment appears on the blockchain either way &mdash; that is the
+      point of this receiver. The difference is off-chain.
+    </p>
+    <ul>
+      <li>
+        <strong>A standard Samourai or Ashigaru wallet</strong> announces your payment code
+        in the clear when it contacts this shop, so anyone watching can see that you are a
+        customer here. That is how their protocol works, not a choice this shop made.
+      </li>
+      <li>
+        <strong>This project's own sender</strong> encrypts your payment code so only this
+        shop can read it. Nobody else learns you were ever here.
+      </li>
+    </ul>
   </div>
 
   <footer>
@@ -98,6 +121,8 @@
         badge.title = 'Test coins only — this receiver is not on mainnet';
       }
       if (s.label) $('heading').textContent = 'Pay ' + s.label;
+      // Only claim this when the receiver actually reports it.
+      if (s.stockWalletPublishesPaymentCode) $('privacy').hidden = false;
       document.title = s.label ? 'Pay ' + s.label : 'Pay me';
     })
     .catch((e) => {

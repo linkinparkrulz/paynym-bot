@@ -37,6 +37,12 @@ function publicStatus(opts: StorefrontOptions) {
     label: opts.label ?? null,
     // Stated explicitly so a customer can see the claim the site is making.
     notificationTransactionRequired: false,
+    // Honest disclosure, not a footnote. A stock Samourai/Ashigaru wallet uses
+    // a transport whose envelope carries the sender's payment code in
+    // cleartext, so paying that way publishes "this person is a customer of
+    // this shop" to anyone who can list the directory. Our own sender tool
+    // encrypts under an ephemeral key and reveals nothing.
+    stockWalletPublishesPaymentCode: true,
   }
 }
 

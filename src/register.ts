@@ -27,6 +27,7 @@
 import { nodeFromPaymentCode } from './bip47.ts'
 import { PaynymIdentity, verifyIdentitySignature } from './identity.ts'
 import { openWithIdentityKey, sealToPaymentCode } from './channel.ts'
+import { openSamourai } from './samourai.ts'
 import { SorobanRPC, encodeDirectory, hex } from './soroban.ts'
 import type { ConfidentialAuth, Mode } from './soroban.ts'
 
@@ -118,6 +119,16 @@ export function inboxName(receiverPaymentCode: string, scheme: Scheme = 'plain')
     return `soroban.register-queue.in.${encodeDirectory(receiverPaymentCode)}`
   }
   return encodeDirectory(`${PROTOCOL}.inbox.${receiverPaymentCode}`)
+}
+
+/**
+ * The directory a stock Samourai/Ashigaru client writes to: SHA256 of the BARE
+ * payment code, with no prefix (RpcDialog.encodeDirectory, seeded with
+ * paymentCodePartner.toString()). We listen here too, or such a wallet could
+ * never reach us.
+ */
+export function samouraiInboxName(receiverPaymentCode: string): string {
+  return encodeDirectory(receiverPaymentCode)
 }
 
 // --- Registry ---------------------------------------------------------------
@@ -242,6 +253,11 @@ export class Registrar {
     return inboxName(this.identity.paymentCode(), this.scheme)
   }
 
+  /** Every directory we drain: ours, plus the one stock wallets use. */
+  inboxes(): string[] {
+    return [this.inbox(), samouraiInboxName(this.identity.paymentCode())]
+  }
+
   /**
    * Drain the inbox: decrypt, verify signatures, register new customers.
    * Returns the payment codes newly added this call.
@@ -256,20 +272,21 @@ export class Registrar {
     rpc: SorobanRPC,
     opts: { onAccepted?: (paymentCode: string) => Promise<void> } = {},
   ): Promise<string[]> {
-    const name = this.inbox()
-    const entries = await rpc.list(name, this.auth)
     const added: string[] = []
-    for (const entry of entries) {
-      const paymentCode = this.ingest(entry)
-      if (!paymentCode) {
-        // Malformed or unverifiable: count it, remove it, continue. A bad entry
-        // must never pin the queue. Never log the ciphertext.
-        this.rejectCount++
-      } else if (this.registry.add(paymentCode)) {
-        if (opts.onAccepted) await opts.onAccepted(paymentCode) // durable before removal
-        added.push(paymentCode)
+    for (const name of this.inboxes()) {
+      const entries = await rpc.list(name, this.auth)
+      for (const entry of entries) {
+        const paymentCode = this.ingest(entry)
+        if (!paymentCode) {
+          // Malformed or unverifiable: count it, remove it, continue. A bad
+          // entry must never pin the queue. Never log the ciphertext.
+          this.rejectCount++
+        } else if (this.registry.add(paymentCode)) {
+          if (opts.onAccepted) await opts.onAccepted(paymentCode) // durable before removal
+          added.push(paymentCode)
+        }
+        await rpc.remove(name, entry)
       }
-      await rpc.remove(name, entry)
     }
     return added
   }
@@ -279,8 +296,28 @@ export class Registrar {
     return this.rejectCount
   }
 
-  /** Decrypt + verify a single sealed inbox entry. Returns the payment code or null. */
+  /**
+   * Decrypt + verify a single inbox entry, in either wire format. Returns the
+   * customer's payment code, or null.
+   *
+   * The two formats authenticate differently, and the difference is the reason
+   * the Samourai path needs no inner signature:
+   *
+   *   Samourai — the payload is encrypted under a STATIC-STATIC ECDH between
+   *     our notification key and the claimed sender's. Forging one would need
+   *     the claimed sender's PRIVATE key, so a payload whose HMAC verifies
+   *     could only have been produced by the holder of that payment code.
+   *     Successful decryption is itself the proof of identity.
+   *
+   *   Ours — the payload is encrypted to us under an EPHEMERAL key, so anyone
+   *     holding our (published) payment code can seal to us. Decryption proves
+   *     nothing about who sent it, which is exactly why that path additionally
+   *     requires the signed envelope below.
+   */
   ingest(sealed: string): string | null {
+    const samourai = openSamourai(this.identity.identityPrivateKey(), sealed)
+    if (samourai) return samourai.sender
+
     const plaintext = openWithIdentityKey(this.identity.identityPrivateKey(), sealed)
     if (!plaintext) return null
     let env: RegisterEnvelope
