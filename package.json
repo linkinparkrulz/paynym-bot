@@ -9,7 +9,7 @@
     "vectors": "node --experimental-strip-types --no-warnings test/vectors.test.ts",
     "protocol": "node --experimental-strip-types --no-warnings test/protocol.test.ts",
     "regress": "node --experimental-strip-types --no-warnings test/register-fixes.test.ts",
-    "test": "npm run vectors && npm run protocol && npm run regress && npm run state && npm run seed && npm run torrc && npm run samourai && npm run config && npm run install-checks && npm run server && npm run electrum && npm run socks && npm run discover && npm run daemon",
+    "test": "npm run vectors && npm run protocol && npm run regress && npm run state && npm run seed && npm run torrc && npm run samourai && npm run config && npm run install-checks && npm run server && npm run auth47 && npm run electrum && npm run socks && npm run discover && npm run daemon",
     "state": "node --experimental-strip-types --no-warnings test/state.test.ts",
     "server": "node --experimental-strip-types --no-warnings test/server.test.ts",
     "electrum": "node --experimental-strip-types --no-warnings test/electrum.test.ts",
@@ -21,7 +21,8 @@
     "samourai": "node --experimental-strip-types --no-warnings test/samourai.test.ts",
     "socks": "node --experimental-strip-types --no-warnings test/socks.test.ts",
     "config": "node --experimental-strip-types --no-warnings test/config.test.ts",
-    "install-checks": "node --experimental-strip-types --no-warnings test/install.test.ts"
+    "install-checks": "node --experimental-strip-types --no-warnings test/install.test.ts",
+    "auth47": "node --experimental-strip-types --no-warnings test/auth47.test.ts"
   },
   "dependencies": {
     "@noble/curves": "^1.7.0",

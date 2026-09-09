@@ -271,10 +271,18 @@ function serve(): void {
     loadSeed(config.seedPath),
     networkFor(state.network),
   )
+  const registry = Registry.fromJSON(state.senders)
   const server = createStorefront({
     identity,
     network: state.network,
     label: values.label ?? state.label,
+    // Address sessions need the registry; serve is storefront-only, so the
+    // persistence callback writes the state file only when a customer
+    // authenticates — cheap, and correct across restarts.
+    registry,
+    persist: async () => {
+      saveState(config.statePath, { ...state, senders: registry.toJSON() })
+    },
   })
 
   // Loopback only. Tor terminates the onion and forwards here; binding any
@@ -343,6 +351,15 @@ function start(): void {
     identity,
     network: state.network,
     label: values.label ?? state.label,
+    // The daemon and the storefront share one registry instance: a customer
+    // authenticated via auth47 becomes a watched sender immediately, and a
+    // payment credited by the scan loop advances the index the storefront
+    // hands out next.
+    registry,
+    persist: async () => {
+      saveState(config.statePath, { ...state, senders: registry.toJSON() })
+    },
+    onionHost: process.env.PAYNYM_BOT_ONION,
   })
 
   server.listen(config.httpPort, '127.0.0.1', () => {
