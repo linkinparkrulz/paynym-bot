@@ -89,6 +89,26 @@ assert('removal keeps every original line',
 assert('removal is a no-op when we were never there', removeBlock(EXISTING).trim() === EXISTING.trim())
 assert('remove after merge round-trips', removeBlock(mergeTorrc(EXISTING, SVC)).trim() === EXISTING.trim())
 
+// --- a damaged file needs a human, not a heuristic ---------------------------
+// A BEGIN with no END (truncated write, hand edit, partial restore) must not be
+// read as "delete everything after". Doing so destroys other operators' hidden
+// services — on a Dojo host, its own API and Soroban onions.
+const dangling = `SocksPort 9050
+${BEGIN_MARKER}
+HiddenServiceDir /var/lib/tor/paynym-bot
+HiddenServicePort 80 127.0.0.1:8462
+
+HiddenServiceDir /var/lib/tor/dojo-api/
+HiddenServicePort 80 172.29.1.3:80`
+
+throws('removeBlock refuses an unbalanced marker', () => removeBlock(dangling), 'END')
+throws('mergeTorrc refuses an unbalanced marker', () => mergeTorrc(dangling, SVC), 'END')
+
+const strayEnd = `SocksPort 9050
+${END_MARKER}
+HiddenServiceDir /var/lib/tor/dojo-api/`
+throws('a stray END marker is refused too', () => removeBlock(strayEnd), 'marker')
+
 console.log('')
 if (failures === 0) {
   console.log("PASS — torrc merging leaves other hidden services alone.")

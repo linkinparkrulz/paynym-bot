@@ -150,6 +150,46 @@ await (async () => {
     assert('substitution: attacker entry counted as rejected', registrar.rejected() === 1)
   }
 
+  // --- A failed persist must not lose the customer -------------------------
+  // The A3 case above builds a FRESH Registrar after the throw, which quietly
+  // simulates a process restart the daemon never performs. The daemon keeps one
+  // long-lived Registrar, so an in-memory add that outlives a failed persist
+  // makes the next tick believe the customer is already known — skipping
+  // persistence and then deleting the only durable copy.
+  {
+    const node = memoryNode()
+    const rpc = new SorobanRPC(node.transport)
+    const bob = PaynymIdentity.fromSeed(BOB_SEED)
+    const alice = PaynymIdentity.fromSeed(ALICE_SEED)
+    const inbox = inboxName(bob.paymentCode())
+
+    const registrar = new Registrar(bob, new Registry())
+    await registerWithReceiver(rpc, alice, bob.paymentCode())
+
+    const persisted: string[] = []
+    try {
+      await registrar.poll(rpc, {
+        onAccepted: async () => {
+          throw new Error('disk full')
+        },
+      })
+    } catch {
+      /* expected */
+    }
+    assert('retry: entry survives the failed tick', node.live(inbox).length === 1)
+
+    // Same process, same Registrar, persistence working again.
+    const added = await registrar.poll(rpc, {
+      onAccepted: async (pc) => {
+        persisted.push(pc)
+      },
+    })
+    assert('retry: the next tick persists the customer', persisted.length === 1)
+    assert('retry: and reports it as newly added', added.length === 1)
+    assert('retry: only then is the durable copy removed', node.live(inbox).length === 0)
+    assert('retry: the registry holds the customer', registrar.registry.has(alice.paymentCode()))
+  }
+
   // --- Test-double fidelity: Remove must not expire the survivors ----------
   {
     const node = memoryNode()

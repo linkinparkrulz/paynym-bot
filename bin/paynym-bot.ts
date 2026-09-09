@@ -71,6 +71,19 @@ function die(message: string): never {
   process.exit(1)
 }
 
+/**
+ * The network flag, refusing anything unrecognised. Silently ignoring a typo
+ * would skip assertNetworkMatches entirely — the opposite of what someone
+ * passing --network is asking for.
+ */
+function requestedNetwork(): NetworkName | undefined {
+  if (values.network === undefined) return undefined
+  if (!isNetworkName(values.network)) {
+    die(`--network must be "mainnet" or "testnet", got "${values.network}"`)
+  }
+  return values.network
+}
+
 /** Ask which network to run on. Only reached when --network was not given. */
 async function promptNetwork(): Promise<NetworkName> {
   if (!process.stdin.isTTY) {
@@ -226,7 +239,8 @@ async function init(): Promise<void> {
 
 function status(): void {
   const state = loadState(config.statePath)
-  if (isNetworkName(values.network)) assertNetworkMatches(state, values.network)
+  const wanted = requestedNetwork()
+  if (wanted !== undefined) assertNetworkMatches(state, wanted)
 
   const identity = PaynymIdentity.fromSeed(
     loadSeed(config.seedPath),
@@ -250,7 +264,8 @@ function status(): void {
 
 function serve(): void {
   const state = loadState(config.statePath)
-  if (isNetworkName(values.network)) assertNetworkMatches(state, values.network)
+  const wanted = requestedNetwork()
+  if (wanted !== undefined) assertNetworkMatches(state, wanted)
 
   const identity = PaynymIdentity.fromSeed(
     loadSeed(config.seedPath),
@@ -285,7 +300,8 @@ function serve(): void {
 
 function start(): void {
   const state = loadState(config.statePath)
-  if (isNetworkName(values.network)) assertNetworkMatches(state, values.network)
+  const wanted = requestedNetwork()
+  if (wanted !== undefined) assertNetworkMatches(state, wanted)
 
   const network = networkFor(state.network)
   const identity = PaynymIdentity.fromSeed(loadSeed(config.seedPath), network)
@@ -370,7 +386,16 @@ async function doctor(): Promise<void> {
       container === 'fulcrum' ? config.electrumHost : new URL(config.sorobanUrl).hostname
     const configuredPort =
       container === 'fulcrum' ? config.electrumPort : Number(new URL(config.sorobanUrl).port || 80)
-    const candidates = isOnion(configuredHost)
+    // Probe what will actually run. Falling back to local discovery whenever the
+    // endpoint is not an onion would diagnose a different deployment than the
+    // one that starts — and doctor is the first thing an operator runs.
+    const configured =
+      container === 'fulcrum'
+        ? process.env.PAYNYM_BOT_ELECTRUM !== undefined ||
+          process.env.PAYNYM_BOT_ELECTRUM_HOST !== undefined ||
+          isOnion(configuredHost)
+        : process.env.PAYNYM_BOT_SOROBAN !== undefined || isOnion(configuredHost)
+    const candidates = configured
       ? explicitCandidate(configuredHost, configuredPort, config.torSocks)
       : await candidatesFor(container, port)
     const result =

@@ -22,6 +22,9 @@ Environment=PAYNYM_BOT_SOROBAN=__SOROBAN_URL__
 Environment=PAYNYM_BOT_ELECTRUM_HOST=__ELECTRUM_HOST__
 Environment=PAYNYM_BOT_ELECTRUM_PORT=__ELECTRUM_PORT__
 Environment=PAYNYM_BOT_HTTP_PORT=__HTTP_PORT__
+# Carried through from the installer. Without it, an install the operator
+# explicitly opted into would pass its own guard and then crash-loop on it.
+Environment=PAYNYM_BOT_ALLOW_REMOTE_INDEXER=__ALLOW_REMOTE_INDEXER__
 
 # --- Hardening -------------------------------------------------------------
 # This process holds a hot BIP47 account key by construction: BIP47 receiving is

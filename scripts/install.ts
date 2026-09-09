@@ -241,6 +241,7 @@ try {
   const remote = await confirm('is your Dojo remote, published as onion services?')
   let electrumCandidates
   let sorobanCandidates
+  let sorobanUrlOverride: string | undefined
   if (remote) {
     info('Dojo Bay lists these; paste them exactly as shown.')
     let parsed
@@ -270,6 +271,9 @@ try {
       Number(sorobanUrlInput.port || 80),
       TOR_SOCKS,
     )
+    // Keep what the operator gave us: sorobanUrlFor rebuilds http://host/rpc,
+    // which silently discards a non-root RPC path and fails the probe.
+    sorobanUrlOverride = sorobanUrlInput.toString()
     info('reaching these over Tor; a circuit takes a few seconds to build.')
   } else {
     electrumCandidates = await candidatesFor('fulcrum', FULCRUM_PORT)
@@ -298,7 +302,7 @@ try {
     if (!DRY) die('cannot install: without Soroban no customer can register')
     warn('a real run would STOP here: no Soroban means no customer can register')
   }
-  const sorobanUrl = soroban.found ? sorobanUrlFor(soroban.found) : '<none>'
+  const sorobanUrl = sorobanUrlOverride ?? (soroban.found ? sorobanUrlFor(soroban.found) : '<none>')
   info(`soroban: ${sorobanUrl}`)
 
   // Refuse before touching the system: on mainnet an indexer the operator does
@@ -412,6 +416,10 @@ try {
     .replaceAll('__ELECTRUM_HOST__', indexer.host)
     .replaceAll('__ELECTRUM_PORT__', String(indexer.port))
     .replaceAll('__HTTP_PORT__', String(httpPort))
+    .replaceAll(
+      '__ALLOW_REMOTE_INDEXER__',
+      process.env.PAYNYM_BOT_ALLOW_REMOTE_INDEXER === 'yes' ? 'yes' : 'no',
+    )
 
   act(`write ${UNIT}`, () => writeFileSync(UNIT, unit, { mode: 0o644 }))
   act('enable and start paynym-bot', () => {

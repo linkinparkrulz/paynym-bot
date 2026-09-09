@@ -160,6 +160,31 @@ await rejects('an unreachable onion explains itself',
 await rejects('no proxy listening fails fast',
   () => socksConnect({ host: '127.0.0.1', port: 1 }, ONION, 50001))
 
+// A proxy that accepts TCP and then says nothing is the dangerous case: without
+// a deadline covering the whole handshake, socksConnect stays pending forever.
+// ElectrumClient caches that promise, and arms its per-request timeout only
+// after connecting resolves — so the scan job wedges permanently while the
+// process still looks healthy and Restart=on-failure never fires.
+const muteSockets: Socket[] = []
+const mute = createServer((socket) => {
+  muteSockets.push(socket)
+  socket.on('error', () => {})
+  // Consume and discard. A socket with no 'data' listener stays paused, so it
+  // never processes the peer's close and would hold server.close() open — an
+  // artefact of the fake, not of the client. Real proxies read.
+  socket.resume()
+  // ...but deliberately never reply.
+})
+await new Promise<void>((r) => mute.listen(0, '127.0.0.1', r))
+const mutePort = (mute.address() as AddressInfo).port
+
+const started = Date.now()
+await rejects('a silent proxy times out rather than hanging',
+  () => socksConnect({ host: '127.0.0.1', port: mutePort }, ONION, 50001, 700), 'timed out')
+assert('and it gives up promptly', Date.now() - started < 5000)
+for (const socket of muteSockets) socket.destroy()
+await new Promise<void>((r) => mute.close(() => r()))
+
 for (const s of [electrumBackend, sorobanBackend, proxyToElectrum, proxyToSoroban, refusing, unreachable]) {
   await new Promise<void>((r) => s.close(() => r()))
 }

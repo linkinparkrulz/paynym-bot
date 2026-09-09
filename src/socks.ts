@@ -91,20 +91,29 @@ export async function socksConnect(
   if (hostname.length > 255) throw new Error(`hostname too long for SOCKS5: ${host}`)
 
   const socket = connect({ host: proxy.host, port: proxy.port })
-  socket.setTimeout(timeoutMs)
 
   const fail = (err: Error) => {
     socket.destroy()
     throw err
   }
 
-  try {
+  // One deadline over the WHOLE handshake, not just the TCP connect.
+  // socket.setTimeout only *emits* 'timeout'; it aborts nothing. A proxy that
+  // accepts and then goes silent would leave this pending forever — and callers
+  // cache the pending promise, so the job wedges permanently while the process
+  // still looks healthy enough that systemd never restarts it.
+  let deadlineTimer: ReturnType<typeof setTimeout> | undefined
+  const deadline = new Promise<never>((_, reject) => {
+    deadlineTimer = setTimeout(() => {
+      socket.destroy()
+      reject(new Error(`SOCKS handshake to ${host}:${port} timed out after ${timeoutMs}ms`))
+    }, timeoutMs)
+  })
+
+  const handshake = async (): Promise<Socket> => {
     await new Promise<void>((resolve, reject) => {
       socket.once('connect', resolve)
       socket.once('error', reject)
-      socket.once('timeout', () => reject(new Error(
-        `timed out connecting to the SOCKS proxy at ${proxy.host}:${proxy.port} — is Tor running?`,
-      )))
     })
 
     // Greeting: version, one method, "no authentication".
@@ -140,10 +149,15 @@ export async function socksConnect(
       await readExactly(socket, len[0] + 2)
     } else return fail(new Error(`SOCKS proxy replied with unknown address type ${atyp}`))
 
-    socket.setTimeout(0) // the handshake deadline must not outlive the handshake
     return socket
+  }
+
+  try {
+    return await Promise.race([handshake(), deadline])
   } catch (err) {
     socket.destroy()
     throw err
+  } finally {
+    clearTimeout(deadlineTimer)
   }
 }

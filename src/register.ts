@@ -170,6 +170,14 @@ export class Registry {
     return true
   }
   /**
+   * Drop a sender. Used only to undo an add whose persistence failed — see
+   * Registrar.poll. Never call this to "forget" a real customer: their payment
+   * code is required to derive addresses money may already have arrived at.
+   */
+  remove(paymentCode: string): void {
+    this.records.delete(paymentCode)
+  }
+  /**
    * Record that `usedIndex` has been paid, and advance the cursor across any
    * CONTIGUOUS run of used indices.
    *
@@ -282,7 +290,16 @@ export class Registrar {
           // entry must never pin the queue. Never log the ciphertext.
           this.rejectCount++
         } else if (this.registry.add(paymentCode)) {
-          if (opts.onAccepted) await opts.onAccepted(paymentCode) // durable before removal
+          try {
+            if (opts.onAccepted) await opts.onAccepted(paymentCode) // durable before removal
+          } catch (err) {
+            // Undo the in-memory add. Without this the next tick sees the
+            // customer as already known, skips persistence entirely, and then
+            // removes the only durable copy — losing the payment code, and with
+            // it the ability to derive addresses money may already sit at.
+            this.registry.remove(paymentCode)
+            throw err
+          }
           added.push(paymentCode)
         }
         await rpc.remove(name, entry)

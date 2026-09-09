@@ -103,6 +103,10 @@ export class ElectrumClient {
 
   /** Wire up a connected socket. Identical whether it came via Tor or not. */
   private attach(socket: Socket): void {
+    // Discard anything left by a previous connection. A drop mid-line would
+    // otherwise prepend a partial response to the next connection's first
+    // reply, corrupting it and costing a full timeout — 30s over Tor.
+    this.buffer = ''
     socket.setEncoding('utf8')
     socket.setKeepAlive(true, 30_000)
     this.socket = socket

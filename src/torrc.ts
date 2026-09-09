@@ -46,8 +46,32 @@ export function hasUnmanagedService(contents: string, dir: string): boolean {
     })
 }
 
+/**
+ * Refuse to operate on a file whose markers are unbalanced.
+ *
+ * A BEGIN with no END (a truncated write, a hand edit, a partial restore) would
+ * otherwise be read as "delete everything after", destroying other operators'
+ * hidden services — on a Dojo host, its own API and Soroban onions. A damaged
+ * torrc needs a human, not a heuristic.
+ */
+function assertBalancedMarkers(contents: string): void {
+  const lines = contents.split('\n').map((l) => l.trim())
+  const begins = lines.filter((l) => l === BEGIN_MARKER).length
+  const ends = lines.filter((l) => l === END_MARKER).length
+  if (begins === ends) return
+  throw new Error(
+    begins > ends
+      ? 'torrc has a paynym-bot BEGIN marker with no matching END marker. Refusing to ' +
+        'touch it: treating that as "delete to end of file" would remove other hidden ' +
+        'services. Repair the block by hand (a .paynym-bot.bak may exist beside it).'
+      : 'torrc has a paynym-bot END marker with no matching BEGIN marker. Refusing to ' +
+        'touch a file whose managed block is damaged; repair it by hand first.',
+  )
+}
+
 /** Strip our managed block, leaving everything else exactly as it was. */
 export function removeBlock(contents: string): string {
+  assertBalancedMarkers(contents)
   const lines = contents.split('\n')
   const out: string[] = []
   let inside = false
