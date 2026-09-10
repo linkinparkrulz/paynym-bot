@@ -251,6 +251,7 @@ function status(): void {
 
   console.log(`\n  network:            ${state.network}`)
   console.log(`  PayNym:             ${identity.paymentCode()}`)
+  console.log(`  published as:       ${config.onion ?? state.onion ?? '(unset — scan-to-pay disabled)'}`)
   console.log(`  registered senders: ${state.senders.length}`)
   console.log(`  addresses watched:  ${window.length}`)
   if (window.length > 0) {
@@ -260,6 +261,25 @@ function status(): void {
     }
   }
   console.log('')
+}
+
+/**
+ * Say plainly whether scan-to-pay is on. The auth47 flow binds every proof to
+ * the host the storefront is published as, and refuses to serve without one —
+ * so an operator who sees the page work but the QR missing needs to be told
+ * why, and told the one thing that fixes it.
+ */
+function announceOnion(onion: string | undefined, httpPort: number): void {
+  if (onion) {
+    console.log(`  published as:  ${onion}  (scan-to-pay enabled)\n`)
+    return
+  }
+  console.log('  scan-to-pay (auth47) is DISABLED: no published host is configured.')
+  console.log('  An auth47 proof is bound to the host it was signed for, and that host')
+  console.log('  must come from you, not from the request — otherwise a proof minted for')
+  console.log('  another site authenticates here. Set it once and it stays set:')
+  console.log('    PAYNYM_BOT_ONION=yourshop.onion   (or the "onion" field in state.json)')
+  console.log(`  For local development, use the host you browse to: 127.0.0.1:${httpPort}\n`)
 }
 
 function serve(): void {
@@ -283,6 +303,9 @@ function serve(): void {
     persist: async () => {
       saveState(config.statePath, { ...state, senders: registry.toJSON() })
     },
+    // Auth47 is bound to this host and is not served without it. See
+    // StorefrontOptions.onionHost.
+    onionHost: config.onion ?? state.onion,
   })
 
   // Loopback only. Tor terminates the onion and forwards here; binding any
@@ -294,6 +317,7 @@ function serve(): void {
     console.log('  Publish it by pointing a Tor hidden service at that port, e.g. in torrc:')
     console.log('    HiddenServiceDir /var/lib/tor/paynym-bot/')
     console.log(`    HiddenServicePort 80 127.0.0.1:${config.httpPort}\n`)
+    announceOnion(config.onion ?? state.onion, config.httpPort)
     console.log('  Ctrl-C to stop.')
   })
 
@@ -359,7 +383,7 @@ function start(): void {
     persist: async () => {
       saveState(config.statePath, { ...state, senders: registry.toJSON() })
     },
-    onionHost: process.env.PAYNYM_BOT_ONION,
+    onionHost: config.onion ?? state.onion,
   })
 
   server.listen(config.httpPort, '127.0.0.1', () => {
@@ -372,6 +396,7 @@ function start(): void {
         `${isOnion(config.electrumHost) ? '  (via Tor)' : ''}`,
     )
     console.log(`  customers:   ${state.senders.length}\n`)
+    announceOnion(config.onion ?? state.onion, config.httpPort)
     daemon.start()
   })
 

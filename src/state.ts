@@ -40,6 +40,15 @@ export type PersistedState = {
   createdAt: number
   /** Optional shop name shown on the storefront above the payment code. */
   label?: string
+  /**
+   * The host this storefront is published as — the .onion Tor generated for
+   * it, recorded by the installer once Tor has written the hostname file.
+   *
+   * This is a security parameter, not a convenience: the Auth47 flow binds
+   * every proof to this host, and it must come from the operator rather than
+   * from a request's own Host header. See StorefrontOptions.onionHost.
+   */
+  onion?: string
   /** Customers who have registered with us. Required to derive receive keys. */
   senders: SenderRecord[]
 }
@@ -73,6 +82,7 @@ export function parseState(raw: string): PersistedState {
     network: s.network,
     createdAt: typeof s.createdAt === 'number' ? s.createdAt : 0,
     label: typeof s.label === 'string' ? s.label : undefined,
+    onion: typeof s.onion === 'string' && s.onion.length > 0 ? s.onion : undefined,
     senders: s.senders as SenderRecord[],
   }
 }

@@ -12,6 +12,21 @@ import type { Registry } from './register.ts'
 
 export const DEFAULT_GAP = 5
 
+/**
+ * How many address lookups a scan pass runs at once.
+ *
+ * The lookups are independent, and each one is a round trip to the indexer —
+ * over Tor that is most of a second, which is why the Electrum client allows
+ * 30s per request. Run serially, a real shop's watch list does not fit in a
+ * scan interval: 100 customers is 500 sequential round trips, and the daemon
+ * skips an overlapping tick rather than queueing, so the scan silently falls
+ * behind and payments go unnoticed. That is the failure this bounds.
+ *
+ * Bounded rather than unlimited because the other end is the operator's own
+ * single Dojo, not a service to be hammered.
+ */
+export const DEFAULT_CONCURRENCY = 6
+
 export type WatchAddress = {
   paymentCode: string
   index: number
@@ -52,20 +67,46 @@ export type Credit = WatchAddress & { spendKey: string }
 
 /**
  * Scan the watch window once, crediting any used addresses and advancing
- * cursors so the window slides forward. Returns the credits found this pass.
+ * cursors so the window slides forward. Returns the credits found this pass,
+ * in watch-window order.
+ *
+ * Lookups run `concurrency` at a time; the cursor updates happen afterwards,
+ * in window order, so the result and the resulting registry state do not
+ * depend on which round trip finished first. `Registry.advance` is
+ * order-independent in any case — it tracks used indices in a set and only
+ * moves the cursor across a contiguous run — but determinism here is what
+ * makes the daemon's behaviour reproducible from the state file alone.
  */
 export async function scanOnce(
   identity: PaynymIdentity,
   registry: Registry,
   isUsed: UsedChecker,
   gap = DEFAULT_GAP,
+  concurrency = DEFAULT_CONCURRENCY,
 ): Promise<Credit[]> {
-  const credits: Credit[] = []
-  for (const w of watchWindow(identity, registry, gap)) {
-    if (await isUsed(w.address)) {
-      credits.push({ ...w, spendKey: identity.receivePrivateKey(w.paymentCode, w.index) })
-      registry.advance(w.paymentCode, w.index)
+  const window = watchWindow(identity, registry, gap)
+  const used = new Array<boolean>(window.length)
+
+  // A fixed pool of workers pulling from a shared cursor: no batching, so one
+  // slow lookup cannot idle the rest of the pool behind it.
+  let next = 0
+  const worker = async (): Promise<void> => {
+    for (;;) {
+      const i = next++
+      if (i >= window.length) return
+      used[i] = await isUsed(window[i]!.address)
     }
+  }
+  await Promise.all(
+    Array.from({ length: Math.max(1, Math.min(concurrency, window.length)) }, worker),
+  )
+
+  const credits: Credit[] = []
+  for (let i = 0; i < window.length; i++) {
+    if (!used[i]) continue
+    const w = window[i]!
+    credits.push({ ...w, spendKey: identity.receivePrivateKey(w.paymentCode, w.index) })
+    registry.advance(w.paymentCode, w.index)
   }
   return credits
 }

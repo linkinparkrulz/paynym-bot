@@ -26,6 +26,12 @@ Environment=PAYNYM_BOT_HTTP_PORT=__HTTP_PORT__
 # explicitly opted into would pass its own guard and then crash-loop on it.
 Environment=PAYNYM_BOT_ALLOW_REMOTE_INDEXER=__ALLOW_REMOTE_INDEXER__
 
+# The host the storefront is published as is read from state.json, which the
+# installer fills in once tor has generated the onion. Set PAYNYM_BOT_ONION
+# here only to override it — the auth47 flow binds every proof to this host and
+# will not serve at all while it is unknown, so a wrong value disables
+# scan-to-pay rather than weakening it.
+
 # --- Hardening -------------------------------------------------------------
 # This process holds a hot BIP47 account key by construction: BIP47 receiving is
 # ECDH with the receiver's private key and has no watch-only variant. It never

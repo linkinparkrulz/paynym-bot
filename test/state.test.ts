@@ -6,7 +6,7 @@
 // These tests pin that: the choice takes effect, and a mismatch is refused
 // loudly rather than silently presenting another PayNym.
 
-import { mkdtempSync, existsSync, statSync, rmSync } from 'node:fs'
+import { mkdtempSync, existsSync, statSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { PaynymIdentity } from '../src/identity.ts'
@@ -119,6 +119,26 @@ assert(
   'testnet sender agrees on the address',
   peer.sendAddress(onTestnet.paymentCode(), 0) === recv,
 )
+
+// --- the published host survives a round trip -------------------------------
+// The auth47 flow is bound to this value and refuses to serve without it, so
+// it has to persist across restarts like any other deployment parameter.
+{
+  const onionPath = join(dir, 'onion-state.json')
+  saveState(onionPath, { ...newState('mainnet'), onion: 'shop7charactersonionaddress.onion' })
+  assert('the onion round-trips through the state file',
+    loadState(onionPath).onion === 'shop7charactersonionaddress.onion')
+
+  const bare = join(dir, 'bare-state.json')
+  saveState(bare, newState('mainnet'))
+  assert('an absent onion reads back as undefined', loadState(bare).onion === undefined)
+
+  // An empty string must not read back as a configured host: it would satisfy
+  // a truthiness check somewhere and re-enable the flow with no binding.
+  const empty = join(dir, 'empty-state.json')
+  writeFileSync(empty, JSON.stringify({ ...newState('mainnet'), onion: '' }))
+  assert('an empty onion is treated as unset', loadState(empty).onion === undefined)
+}
 
 rmSync(dir, { recursive: true, force: true })
 

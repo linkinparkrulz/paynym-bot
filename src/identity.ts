@@ -22,9 +22,29 @@ function toHex(u8: Uint8Array): string {
   return Buffer.from(u8).toString('hex')
 }
 
+/**
+ * Ceiling on the derived-address memo. MAX_SENDERS x the default gap is 50,000
+ * live entries; the extra room absorbs cursors advancing without churning the
+ * cache. Each entry is a short string, so the whole thing is a few megabytes at
+ * worst — traded against roughly 5ms of ECDH per address per scan pass.
+ */
+const ADDRESS_CACHE_MAX = 200_000
+
 export class PaynymIdentity {
   readonly network: Network
   readonly account: HDKey
+  /**
+   * Memo of derived receive addresses, keyed by payment code and index.
+   *
+   * This is a cache of a pure function — a BIP47 receive address is fixed by
+   * both parties' codes and the index — but it is not an optional nicety. The
+   * watcher rebuilds its whole window on every scan pass, and each address
+   * costs an ECDH plus a hash: measured at ~5ms, so 200 customers at the
+   * default gap is five seconds of CPU per tick, every tick, forever. Without
+   * the memo the scan stops fitting in its interval long before the indexer
+   * round trips become the bottleneck.
+   */
+  private readonly addressCache = new Map<string, string>()
 
   private constructor(account: HDKey, network: Network) {
     this.account = account
@@ -71,9 +91,24 @@ export class PaynymIdentity {
     return sig.toDERHex()
   }
 
-  /** Receiver: address to receive sender's `index`-th payment. */
+  /**
+   * Receiver: address to receive sender's `index`-th payment. Memoised; see
+   * `addressCache`. Derivation is deterministic, so a hit is indistinguishable
+   * from a fresh derivation.
+   */
   receiveAddress(senderPaymentCode: string, index: number): string {
-    return receiveAddress(this.account, senderPaymentCode, index, this.network)
+    const key = `${senderPaymentCode}:${index}`
+    const hit = this.addressCache.get(key)
+    if (hit !== undefined) return hit
+    const address = receiveAddress(this.account, senderPaymentCode, index, this.network)
+    // Bounded, oldest-first: Map iterates in insertion order, and the oldest
+    // key is the one furthest behind the moving watch window.
+    if (this.addressCache.size >= ADDRESS_CACHE_MAX) {
+      const oldest = this.addressCache.keys().next().value
+      if (oldest !== undefined) this.addressCache.delete(oldest)
+    }
+    this.addressCache.set(key, address)
+    return address
   }
 
   /** Receiver: spend key (hex) for `receiveAddress(senderPaymentCode, index)`. */

@@ -36,6 +36,14 @@ export type Config = {
   torSocks: SocksProxy
   /** Set when the operator has accepted exposing the watch list. See below. */
   allowRemoteIndexerOnMainnet: boolean
+  /**
+   * The host the storefront is published as, overriding the one recorded in
+   * the state file. The Auth47 flow is bound to it and is not served without
+   * it — see StorefrontOptions.onionHost for why it cannot be inferred from
+   * the request. For local development, set it to the loopback host and port
+   * you actually browse to, e.g. `127.0.0.1:8480`.
+   */
+  onion?: string
 }
 
 function env(name: string): string | undefined {
@@ -157,5 +165,6 @@ export function loadConfig(overrides: { dataDir?: string } = {}): Config {
       port: Number(env('PAYNYM_BOT_TOR_SOCKS_PORT') ?? DEFAULT_TOR_SOCKS_PORT),
     },
     allowRemoteIndexerOnMainnet: (env('PAYNYM_BOT_ALLOW_REMOTE_INDEXER') ?? '').toLowerCase() === 'yes',
+    onion: env('PAYNYM_BOT_ONION'),
   }
 }

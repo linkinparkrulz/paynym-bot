@@ -9,7 +9,7 @@ import { join } from 'node:path'
 import { PaynymIdentity } from '../src/identity.ts'
 import { SorobanRPC } from '../src/soroban.ts'
 import { Registrar, Registry, registerWithReceiver, inboxName } from '../src/register.ts'
-import { watchWindow } from '../src/watcher.ts'
+import { scanOnce, watchWindow } from '../src/watcher.ts'
 import { Daemon } from '../src/daemon.ts'
 import { loadState, networkFor, newState, saveState } from '../src/state.ts'
 import { memoryNode } from './memory-node.ts'
@@ -150,6 +150,98 @@ await (async () => {
   broken.stop()
   assert('a failing backend is logged, not fatal', brokenLines.some((l) => l.includes('failed')))
   assert('ticks kept running after failures', brokenLines.length >= 2)
+})()
+
+// --- the watch list is bounded, and a flood does not become permanent -------
+//
+// Registration is open by design and payment codes are free to generate, so
+// the watch list is an unauthenticated write and needs a ceiling. Past that
+// ceiling a valid registration must NOT be silently dropped — it is left in
+// the inbox to be admitted once room appears, because it may be a real
+// customer rather than a flood.
+await (async () => {
+  const node2 = memoryNode()
+  const rpc2 = new SorobanRPC(node2.transport)
+  const capped = new Registry(1) // capacity of one, so the cap is reachable
+  const registrar = new Registrar(merchant, capped)
+
+  const first = PaynymIdentity.fromSeed(fromHex('11'.repeat(64)), NETWORK)
+  const second = PaynymIdentity.fromSeed(fromHex('22'.repeat(64)), NETWORK)
+  await registerWithReceiver(rpc2, first, merchant.paymentCode())
+  await registerWithReceiver(rpc2, second, merchant.paymentCode())
+
+  const added = await registrar.poll(rpc2)
+  assert('only the first registration fits under the cap', added.length === 1)
+  assert('the watch list stopped at the cap', capped.size() === 1)
+  assert('the one that did not fit was counted, not lost', registrar.deferred() === 1)
+  assert(
+    'and it is still in the inbox, awaiting room',
+    (await rpc2.list(inboxName(merchant.paymentCode()))).length === 1,
+  )
+
+  // Pruning is what makes room. The admitted customer has never been paid, so
+  // it is eligible once it is old enough — and the queued one is then taken.
+  const later = Date.now() + 31 * 24 * 60 * 60 * 1000
+  const dropped = capped.pruneUnpaid(30 * 24 * 60 * 60 * 1000, later)
+  assert('an unpaid registration is prunable once stale', dropped.length === 1)
+  const admitted = await registrar.poll(rpc2)
+  assert('the queued registration is admitted after the prune', admitted.length === 1)
+  assert('and the inbox is finally drained', (await rpc2.list(inboxName(merchant.paymentCode()))).length === 0)
+})()
+
+// --- a paid registration is never pruned -----------------------------------
+// This is the line that must not move: a sender with any payment history holds
+// the only route back to money that has already arrived.
+await (async () => {
+  const reg = new Registry()
+  reg.add(customer.paymentCode(), undefined, 1)
+  reg.advance(customer.paymentCode(), 0) // one payment seen
+  const dropped = reg.pruneUnpaid(1, Date.now())
+  assert('a sender that has been paid survives pruning', dropped.length === 0)
+  assert('and is still registered', reg.has(customer.paymentCode()))
+
+  const unpaid = new Registry()
+  unpaid.add('PM8T-never-paid', undefined, 1)
+  assert('an unpaid sender of the same age is pruned', unpaid.pruneUnpaid(1, Date.now()).length === 1)
+})()
+
+// --- the scan fits in a tick -------------------------------------------------
+//
+// The lookups are independent round trips; run serially, a real shop's watch
+// list does not fit in a scan interval. Assert both halves of the fix: the
+// lookups overlap, and the addresses are not re-derived from scratch each pass
+// (a BIP47 address costs an ECDH, and the window is rebuilt every tick).
+await (async () => {
+  const many = new Registry()
+  for (let i = 0; i < 20; i++) {
+    many.add(PaynymIdentity.fromSeed(fromHex(String(i + 10).repeat(32)), NETWORK).paymentCode())
+  }
+  const window = watchWindow(merchant, many)
+  assert('the window covers every sender', window.length === 100)
+
+  let inFlight = 0
+  let peak = 0
+  const slowOracle: UsedChecker = async () => {
+    inFlight++
+    peak = Math.max(peak, inFlight)
+    await new Promise((r) => setTimeout(r, 5))
+    inFlight--
+    return false
+  }
+
+  const t0 = Date.now()
+  await scanOnce(merchant, many, slowOracle)
+  const cold = Date.now() - t0
+  assert('lookups overlap rather than running one at a time', peak > 1)
+  assert('and stay bounded, not all at once', peak <= 6)
+  assert(`a 100-address window beats serial (${cold}ms vs ${100 * 5}ms)`, cold < 100 * 5)
+
+  // Second pass: derivation is memoised, so the pass costs only its round
+  // trips. With 6-way concurrency that is ~100/6 * 5ms.
+  const t1 = Date.now()
+  await scanOnce(merchant, many, slowOracle)
+  const warm = Date.now() - t1
+  assert(`a warm pass is close to pure latency (${warm}ms)`, warm < 200)
 })()
 
 rmSync(dir, { recursive: true, force: true })

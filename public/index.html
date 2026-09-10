@@ -196,6 +196,13 @@
   async function startAuthFlow() {
     try {
       const r = await fetch('/api/auth47/challenge', { method: 'POST' });
+      if (r.status === 429 || r.status === 503) {
+        // Throttled, not broken: the shop limits how fast challenges are
+        // handed out. Say so in those terms, and offer the way through.
+        $('auth-status').textContent =
+          'Busy right now — reload in a moment, or copy the payment code below.';
+        return;
+      }
       if (!r.ok) throw new Error('HTTP ' + r.status);
       const c = await r.json();
 

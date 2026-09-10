@@ -147,12 +147,52 @@ export type SenderRecord = {
 }
 
 /**
+ * Ceiling on registered senders.
+ *
+ * Registration is open by design — the payment code is published and anyone
+ * may send — and it costs an attacker nothing to generate payment codes, so
+ * without a ceiling the watch list is an unauthenticated write. Every sender
+ * adds `gap` addresses to each scan pass, so an unbounded list stops the
+ * receiver from noticing real payments long before it exhausts memory.
+ *
+ * 10,000 senders is 50,000 watched addresses at the default gap: far more than
+ * a self-hosted shop will see, and still a bounded scan.
+ */
+export const MAX_SENDERS = 10_000
+
+/**
+ * How long a registration that has never been paid is kept.
+ *
+ * Pruning these is what keeps a flood from being permanent. It is safe in the
+ * way that matters — a record with no payment at any watched index has no
+ * money behind it, so nothing becomes unspendable — but it is not free: a
+ * customer who registers, waits longer than this, and only then pays would
+ * find their payment unwatched until they register again. 30 days is chosen to
+ * make that essentially theoretical for a shopping visit.
+ */
+export const UNPAID_TTL_MS = 30 * 24 * 60 * 60 * 1000
+
+/**
  * The customers who have registered with us. This is key material: receive keys
  * cannot be re-derived from the seed alone, because a BIP47 address depends on
  * BOTH parties' payment codes. Persist it alongside the seed.
  */
 export class Registry {
   private records = new Map<string, SenderRecord>()
+  private readonly capacity: number
+
+  constructor(capacity: number = MAX_SENDERS) {
+    this.capacity = capacity
+  }
+
+  size(): number {
+    return this.records.size
+  }
+
+  /** True when no further NEW sender can be accepted. See MAX_SENDERS. */
+  isFull(): boolean {
+    return this.records.size >= this.capacity
+  }
 
   has(paymentCode: string): boolean {
     return this.records.has(paymentCode)
@@ -163,11 +203,36 @@ export class Registry {
   all(): SenderRecord[] {
     return [...this.records.values()]
   }
-  /** Add a sender if new. Returns true if this was a new registration. */
+  /**
+   * Add a sender if new. Returns true if this was a new registration.
+   *
+   * Refuses once full: callers that care about the difference between "already
+   * known" and "no room" should check `isFull()` first, which is what the
+   * storefront does so it can say so in its response.
+   */
   add(paymentCode: string, label?: string, now = Date.now()): boolean {
     if (this.records.has(paymentCode)) return false
+    if (this.isFull()) return false
     this.records.set(paymentCode, { paymentCode, label, firstSeen: now, nextIndex: 0 })
     return true
+  }
+
+  /**
+   * Drop registrations that have never been paid and are older than `ttlMs`,
+   * oldest first. Returns the codes removed.
+   *
+   * "Never paid" is exact, not a guess: `nextIndex === 0` with an empty
+   * `usedAhead` means no index has ever been seen used, so no money has
+   * arrived at any address this sender's code derives. A sender with any
+   * payment history is never pruned, whatever its age — see `remove`.
+   */
+  pruneUnpaid(ttlMs = UNPAID_TTL_MS, now = Date.now()): string[] {
+    const cutoff = now - ttlMs
+    const stale = this.all()
+      .filter((r) => r.nextIndex === 0 && (r.usedAhead ?? []).length === 0 && r.firstSeen < cutoff)
+      .sort((a, b) => a.firstSeen - b.firstSeen)
+    for (const r of stale) this.records.delete(r.paymentCode)
+    return stale.map((r) => r.paymentCode)
   }
   /**
    * Drop a sender. Used only to undo an add whose persistence failed — see
@@ -241,6 +306,7 @@ export class Registrar {
   private readonly scheme: Scheme
   private readonly auth?: ConfidentialAuth
   private rejectCount = 0
+  private deferredCount = 0
 
   constructor(
     identity: PaynymIdentity,
@@ -289,6 +355,16 @@ export class Registrar {
           // Malformed or unverifiable: count it, remove it, continue. A bad
           // entry must never pin the queue. Never log the ciphertext.
           this.rejectCount++
+        } else if (this.registry.has(paymentCode)) {
+          // Already known. Idempotent: fall through and drop the entry.
+        } else if (this.registry.isFull()) {
+          // Valid, but there is no room on the watch list. Unlike a malformed
+          // entry this one deserves to be kept: leave it in the inbox (skip
+          // the removal below) so it is accepted as soon as a stale unpaid
+          // registration is pruned. Its own directory TTL bounds how long it
+          // can sit there.
+          this.deferredCount++
+          continue
         } else if (this.registry.add(paymentCode)) {
           try {
             if (opts.onAccepted) await opts.onAccepted(paymentCode) // durable before removal
@@ -311,6 +387,14 @@ export class Registrar {
   /** Number of inbox entries rejected for failing to decrypt or verify. */
   rejected(): number {
     return this.rejectCount
+  }
+
+  /**
+   * Number of valid registrations left in the inbox because the watch list was
+   * full. Non-zero means real customers are waiting on a prune.
+   */
+  deferred(): number {
+    return this.deferredCount
   }
 
   /**

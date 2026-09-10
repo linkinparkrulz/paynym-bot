@@ -38,6 +38,15 @@ export const NONCE_TTL_MS = 5 * 60 * 1000
 export const SESSION_TTL_MS = 12 * 60 * 60 * 1000
 
 /**
+ * Ceiling on live challenges. `issue()` is unauthenticated — anyone with the
+ * onion address can POST for one — and gc() only reclaims entries that have
+ * actually expired, so without a cap a few minutes of POSTs pin unbounded
+ * memory. The limit is far above any real storefront's concurrent shoppers and
+ * far below anything that matters to the process.
+ */
+export const MAX_LIVE_NONCES = 4096
+
+/**
  * Bitcoin signed-message prefix, exactly as bitcoinjs-message defines it:
  * a literal 0x18 control byte, then "Bitcoin Signed Message:\n". The 0x18 is
  * load-bearing — omit it and the digest differs, pubkey recovery lands on a
@@ -279,22 +288,49 @@ export class Auth47Sessions {
     for (const [k, v] of this.sessions) if (v.expires < now) this.sessions.delete(k)
   }
 
-  /** Record a freshly issued challenge nonce. */
-  issue(nonce: string, ttlMs = NONCE_TTL_MS): void {
+  /**
+   * Record a freshly issued challenge nonce. Returns false when the store is
+   * already at MAX_LIVE_NONCES, so the caller can refuse rather than grow: the
+   * endpoint that calls this is unauthenticated.
+   */
+  issue(nonce: string, ttlMs = NONCE_TTL_MS): boolean {
     this.gc()
+    if (this.nonces.size >= MAX_LIVE_NONCES) return false
     this.nonces.set(nonce, { expires: this.now() + ttlMs, used: false })
+    return true
+  }
+
+  /**
+   * Is this nonce live and unconsumed? A Map lookup, so it is the cheap gate
+   * to put in front of signature verification — which costs an ECDSA recovery
+   * and a base58 encode on input nobody has authenticated yet.
+   *
+   * Deliberately does NOT consume: a wallet that submits a malformed proof
+   * should not burn the customer's challenge.
+   */
+  peek(nonce: string): boolean {
+    const rec = this.nonces.get(nonce)
+    return rec !== undefined && !rec.used && rec.expires >= this.now()
   }
 
   /**
    * Consume a nonce: single-use, exactly once. Returns the record so the
    * caller can bind a session to it, or null when unknown/expired/used.
+   *
+   * A record that has already been used is left in place, NOT deleted. It
+   * carries the session id the customer's browser is still polling for, so
+   * dropping it here would let a replayed (or merely retried) proof destroy
+   * the legitimate customer's session before they ever claimed it. It expires
+   * on its own shortly afterwards.
    */
   take(nonce: string): NonceRecord | null {
     const rec = this.nonces.get(nonce)
-    if (!rec || rec.used || rec.expires < this.now()) {
+    if (!rec) return null
+    if (rec.expires < this.now()) {
       this.nonces.delete(nonce)
       return null
     }
+    if (rec.used) return null
     rec.used = true
     rec.expires = this.now() + NONCE_TTL_MS // short window for the poll claim
     return rec
@@ -306,10 +342,18 @@ export class Auth47Sessions {
     if (rec) rec.sessionId = sessionId
   }
 
-  /** The session a nonce minted, if its poll window is still open. */
+  /**
+   * The session a nonce minted, handed out ONCE. The nonce is the payload of
+   * the QR on the customer's screen, so anyone who photographs it could
+   * otherwise poll for the session id the moment the customer authenticates.
+   * Claiming it retires the nonce, so only the first poll — the customer's own
+   * browser — gets the session.
+   */
   claimed(nonce: string): string | null {
     const rec = this.nonces.get(nonce)
-    return rec && rec.used && rec.sessionId ? rec.sessionId : null
+    if (!rec || !rec.used || !rec.sessionId) return null
+    this.nonces.delete(nonce)
+    return rec.sessionId
   }
 
   /** Mint a session for an authenticated payment code. Returns its id. */

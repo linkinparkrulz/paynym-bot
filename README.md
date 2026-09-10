@@ -56,6 +56,27 @@ Anything ending in `.onion` is routed through Tor's SOCKS proxy automatically
 > testnet, where there are no real counterparties. Your own Dojo, on loopback or a private
 > network, is always allowed.
 
+### Scan-to-pay, and the host it is bound to
+
+A customer scans the storefront's QR, their wallet signs it, and the page shows the
+address to pay. That is [Auth47](https://github.com/Dojo-Open-Source-Project/auth47-specification),
+and every proof it produces is bound to the host it was signed for — so a proof minted
+for some other site cannot authenticate here.
+
+That binding only means something if the host comes from **you**. If it were read from
+each request's own `Host` header, an attacker could ask this server for a challenge while
+claiming their own site, have a victim's wallet sign it, and relay the proof straight
+back — the comparison would pass, because both halves would be the attacker's own string.
+
+So the installer records the onion in `state.json` once Tor has generated it, and the
+storefront refuses to run the flow at all while that value is unknown. The rest of the
+page still works; only scan-to-pay is withheld. To set it by hand, or to develop locally:
+
+```bash
+export PAYNYM_BOT_ONION="yourshop.onion"     # or 127.0.0.1:8480 for local dev
+paynym-bot status                            # shows what it is published as
+```
+
 Removal is a dry run unless you ask for it:
 
 ```bash

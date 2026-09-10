@@ -9,7 +9,7 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'n
 import { createInterface } from 'node:readline/promises'
 import { join } from 'node:path'
 import { PaynymIdentity } from '../src/identity.ts'
-import { networkFor, newState, saveState } from '../src/state.ts'
+import { loadState, networkFor, newState, saveState } from '../src/state.ts'
 import { isValidMnemonic, newMnemonic, normaliseMnemonic, seedFromMnemonic } from '../src/seed.ts'
 import { mergeTorrc } from '../src/torrc.ts'
 import {
@@ -400,9 +400,24 @@ try {
     }
     if (onion === '<pending>') {
       warn(`tor has not written ${hostnameFile} yet — check: journalctl -u tor`)
+      warn('the scan-to-pay (auth47) flow stays disabled until it is recorded')
     } else {
       info(`onion: ${onion}`)
     }
+  }
+
+  // Record the onion in the state file. This is not cosmetic: the auth47 flow
+  // binds every proof to this host and refuses to run without it, precisely so
+  // the binding cannot be chosen by a request's own Host header. The state was
+  // written before tor existed, so it is updated here.
+  // Runs in dry mode too — as a "would:" line — so the plan shows the step
+  // rather than hiding a security-relevant one behind an if.
+  if (DRY || onion !== '<pending>') {
+    act('record the onion in state.json (binds the auth47 flow to it)', () => {
+      const statePath = join(dataDir, 'state.json')
+      saveState(statePath, { ...loadState(statePath), onion })
+      sh('chown', [`${SERVICE_USER}:${SERVICE_USER}`, statePath])
+    })
   }
 
   // --- 8. Service -----------------------------------------------------------

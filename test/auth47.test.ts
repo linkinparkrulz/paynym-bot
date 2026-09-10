@@ -17,6 +17,7 @@ import {
   sameResource,
   newNonce,
   NONCE_TTL_MS,
+  MAX_LIVE_NONCES,
 } from '../src/auth47.ts'
 import { secp256k1 } from '@noble/curves/secp256k1'
 import { sha256 } from '@noble/hashes/sha256'
@@ -195,6 +196,62 @@ assert('nonce expires with its TTL', clockSessions.take(n4) === null)
 const sid5 = clockSessions.mint(alice.paymentCode())
 fakeNow += 12 * 60 * 60 * 1000 + 1
 assert('session expires with its TTL', clockSessions.session(sid5) === null)
+
+// --- the store cannot be grown without bound -----------------------------------
+// issue() is reached by an unauthenticated POST, and gc() only reclaims what
+// has actually expired, so the cap is the only thing standing between a POST
+// loop and unbounded memory.
+{
+  const bounded = new Auth47Sessions()
+  let issued = 0
+  for (let i = 0; i < MAX_LIVE_NONCES + 50; i++) if (bounded.issue(newNonce())) issued++
+  assert('issue stops at the cap', issued === MAX_LIVE_NONCES)
+  assert('and says so, rather than growing quietly', bounded.issue(newNonce()) === false)
+}
+
+// --- peek is the cheap gate, and does not consume ------------------------------
+// The nonce check has to come before signature verification, which costs an
+// ECDSA recovery on unauthenticated input. But peeking must not burn the
+// customer's challenge: a wallet that posts one malformed proof should still
+// be able to post a good one.
+{
+  const gate = new Auth47Sessions()
+  const n = newNonce()
+  gate.issue(n)
+  assert('peek sees a live nonce', gate.peek(n))
+  assert('peek does not consume it', gate.peek(n) && gate.take(n) !== null)
+  assert('peek is false once consumed', !gate.peek(n))
+  assert('peek is false for an unknown nonce', !gate.peek(newNonce()))
+}
+
+// --- a replayed proof must not destroy the real customer's session -------------
+// take() leaves a consumed record in place precisely so the session id it
+// carries survives until the browser polls for it. Deleting it here would let
+// a replay — or a wallet that merely retried — cancel the legitimate login.
+{
+  const st = new Auth47Sessions()
+  const n = newNonce()
+  st.issue(n)
+  st.take(n)
+  const sessionId = st.mint(alice.paymentCode())
+  st.claim(n, sessionId)
+  assert('a replay is still refused', st.take(n) === null)
+  assert('but the pending session survives the replay', st.claimed(n) === sessionId)
+}
+
+// --- the session is claimed once ----------------------------------------------
+// The nonce is the payload of the QR on the customer's screen, so an onlooker
+// who photographs it must not be able to poll for the session behind them.
+{
+  const once = new Auth47Sessions()
+  const n = newNonce()
+  once.issue(n)
+  once.take(n)
+  const sessionId = once.mint(alice.paymentCode())
+  once.claim(n, sessionId)
+  assert('the first claim wins', once.claimed(n) === sessionId)
+  assert('a second claim gets nothing', once.claimed(n) === null)
+}
 
 console.log('')
 if (failures === 0) {
