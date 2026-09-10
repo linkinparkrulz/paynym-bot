@@ -56,34 +56,39 @@ Anything ending in `.onion` is routed through Tor's SOCKS proxy automatically
 > testnet, where there are no real counterparties. Your own Dojo, on loopback or a private
 > network, is always allowed.
 
-### When a wallet's proof is rejected
+### Auth47 verification is the Samourai libraries', not ours
 
-`"bad signature"` is a verdict, not a diagnosis, and there are only three plausible causes:
-the wallet signed a different serialization of the challenge than it posted, it signed with
-the wrong key, or its message framing disagrees with ours. Those are distinguishable, so
-the receiver distinguishes them. On a rejection it logs which one:
+The signature check on the scan-to-pay path is delegated to
+[`@dojo-tools/auth47`](https://github.com/Dojo-Open-Source-Project/dojo-tools),
+`@dojo-tools/bip47` and `@dojo-tools/bitcoinjs-message` — the same libraries
+[The Dojo Bay](https://github.com/Dojobay/dojobay) uses, and the ones Ashigaru and Samourai
+demonstrably interoperate with. `src/auth47.ts` is a thin wrapper: challenge construction,
+the nonce and session stores, and two policy decisions the library cannot make for us
+(an address-only proof cannot name a BIP47 counterparty, and the callback parameter must
+already be stripped).
 
-```
-[auth47] rejected a proof from PM8TJUUoFBTJ…: the signature is valid, but not over what
-         was posted: it verifies over "the challenge as posted" using the magic WITHOUT
-         the leading 0x18 control byte, recovery id 0, compressed key
-[auth47]   expected notification address: 1Gwnw69NWZRzPgfDrvmV6WEpd4tt52MgCm
-[auth47]   signature recovers to: 1Nm4CJihAHpxBWH7z6RGsudGqagxseeCKb, …
-[auth47]   posted challenge:  auth47://5b77…?e=…&r=http://…
-[auth47]   we issued:         auth47://5b77…?c=http://…&e=…&r=http://…
-```
+That is deliberate, and it was learned expensively. This code previously hand-rolled the
+signed-message framing and the signature decode, and got the layout backwards — a
+bitcoinjs-message signature is `[header | r | s]`, with the recovery flag as the **first**
+byte, and it was read as `[r | s | header]`. Every real wallet proof failed as
+`"bad signature"`, and the test suite stayed green throughout, because its helper signed
+with the same wrong layout it verified. The tests now sign through the library, and the
+byte layout is pinned by an explicit assertion.
 
-The wallet still gets only the single word — it has no business being told which internal
-check failed. To work on a captured payload offline:
+A proof is checked against **both** notification-address derivations. A PayNym is a mainnet
+identity, but a wallet in testnet mode signs from the testnet derivation of the same code;
+refusing that silently rejects good proofs. Both addresses come from the same payment code,
+so accepting either is no weaker — this follows Dojo Bay, which documents the same fix.
+
+On a rejection the receiver logs the library's error, the challenge that was posted, and
+the challenge it issued for that nonce — a mismatch between the last two is the thing worth
+seeing. The wallet gets only the error; it has no business being told more. To check a
+captured payload offline:
 
 ```bash
-paynym-bot verify-proof proof.json
-paynym-bot verify-proof proof.json --challenge "auth47://…"   # the URI we issued, from the log
-pbpaste | paynym-bot verify-proof --network mainnet
+paynym-bot verify-proof proof.json --callback http://yourshop.onion/api/auth47/callback
+pbpaste | paynym-bot verify-proof --callback http://yourshop.onion/api/auth47/callback
 ```
-
-It re-runs the recovery across every framing, every candidate string and all four recovery
-ids, and reports which combination reproduces the key the payment code names.
 
 ### Scan-to-pay, and the host it is bound to
 

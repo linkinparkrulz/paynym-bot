@@ -25,6 +25,10 @@
     "auth47": "node --experimental-strip-types --no-warnings test/auth47.test.ts"
   },
   "dependencies": {
+    "@bitcoinerlab/secp256k1": "^2.0.0",
+    "@dojo-tools/auth47": "^2.0.0",
+    "@dojo-tools/bip47": "^2.0.0",
+    "@dojo-tools/bitcoinjs-message": "^4.0.0",
     "@noble/curves": "^1.7.0",
     "@noble/hashes": "^1.6.0",
     "@scure/base": "^1.2.0",

@@ -15,12 +15,13 @@ import { PaynymIdentity } from '../src/identity.ts'
 import { createStorefront } from '../src/server.ts'
 import { Registry } from '../src/register.ts'
 import { networkFor } from '../src/state.ts'
-import { signedForm, challengeURI, signedMessageBytes } from '../src/auth47.ts'
+import { signedForm, challengeURI } from '../src/auth47.ts'
+import { bitcoinMessageFactory } from '@dojo-tools/bitcoinjs-message'
+import * as bip47utils from '@dojo-tools/bip47/utils'
+import ecc from '@bitcoinerlab/secp256k1'
 import { connect as netConnect, createServer as createNetServer } from 'node:net'
 import type { AddressInfo } from 'node:net'
 import type { NetworkName } from '../src/state.ts'
-import { secp256k1 } from '@noble/curves/secp256k1'
-import { sha256 } from '@noble/hashes/sha256'
 
 let failures = 0
 function assert(name: string, cond: boolean): void {
@@ -89,6 +90,8 @@ function rawRequest(
   })
 }
 
+const bitcoinMessage = bitcoinMessageFactory(ecc)
+
 const registry = new Registry()
 let persisted = 0
 const port = await freePort()
@@ -151,15 +154,24 @@ assert(
   new URL(challenge.uri).searchParams.get('c') === `${base}/api/auth47/callback`,
 )
 
-// Wallet side: sign the prepared form with the notification key, base64 compact+recovery.
-function walletSignature(message: string): string {
-  const digest = sha256(sha256(signedMessageBytes(message)))
-  const sig = secp256k1.sign(digest, customer.identityPrivateKey())
-  const out = new Uint8Array(65)
-  out.set(sig.toBytes())
-  out[64] = sig.recovery + 31 // bitcoinjs-message header: 31..34 = compressed key
-  return Buffer.from(out).toString('base64')
+/**
+ * Wallet side: sign through @dojo-tools/bitcoinjs-message, the library a real
+ * wallet uses. Nothing here builds the signed-message bytes or lays out the
+ * signature itself — a helper that constructs them the way the code under test
+ * expects proves only that the test agrees with itself, which is exactly how a
+ * reversed signature layout survived a green suite.
+ */
+function signAs(identity: PaynymIdentity, message: string): string {
+  const sig = bitcoinMessage.sign(
+    message,
+    identity.identityPrivateKey(),
+    true,
+    bip47utils.networks.bitcoin.messagePrefix,
+  )
+  return Buffer.from(sig).toString('base64')
 }
+
+const walletSignature = (message: string): string => signAs(customer, message)
 
 const prepared = signedForm(challenge.uri)!
 const proof = {
@@ -436,18 +448,13 @@ await new Promise<void>((resolve) => unbound.close(() => resolve()))
   const authenticate = async (who: PaynymIdentity): Promise<number> => {
     const c = await (await fetch(`${cappedBase}/api/auth47/challenge`, { method: 'POST' })).json()
     const prep = signedForm(c.uri)!
-    const digest = sha256(sha256(signedMessageBytes(prep)))
-    const sig = secp256k1.sign(digest, who.identityPrivateKey())
-    const out = new Uint8Array(65)
-    out.set(sig.toBytes())
-    out[64] = sig.recovery + 31
     const res = await fetch(`${cappedBase}/api/auth47/callback`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
         auth47_response: '1.0',
         challenge: prep,
-        signature: Buffer.from(out).toString('base64'),
+        signature: signAs(who, prep),
         nym: who.paymentCode(),
       }),
     })

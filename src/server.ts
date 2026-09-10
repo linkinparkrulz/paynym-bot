@@ -23,14 +23,10 @@ import type { IncomingMessage, Server, ServerResponse } from 'node:http'
 import type { PaynymIdentity } from './identity.ts'
 import type { Registry } from './register.ts'
 import type { NetworkName } from './state.ts'
-import type { Network } from './bip47.ts'
 import {
   Auth47Sessions,
   challengeURI,
-  explainSignature,
   newNonce,
-  notificationAddressOf,
-  proofCandidates,
   sameResource,
   verifyProof,
   NONCE_TTL_MS,
@@ -166,59 +162,10 @@ function publicStatus(opts: StorefrontOptions, auth47Available: boolean) {
   }
 }
 
-/**
- * Explain a rejected signature into the log, once, at the point of failure.
- *
- * Payment codes are truncated to 12 characters, matching the daemon's
- * convention. The addresses are not secret — both are derivable from the
- * payment code, which is published — and they are the whole point: the address
- * the signature actually recovers to is what separates "signed with the wrong
- * key" from "framed the message differently".
- */
-function logSignatureFailure(proof: unknown, issuedUri: string | undefined, network: Network): void {
-  const p = proof as Partial<{ challenge: string; signature: string; nym: string }>
-  if (typeof p.challenge !== 'string' || typeof p.signature !== 'string' || typeof p.nym !== 'string') {
-    return
-  }
-  let expected: string
-  try {
-    expected = notificationAddressOf(p.nym, network)
-  } catch {
-    return
-  }
-  const report = explainSignature(
-    proofCandidates(p.challenge, issuedUri),
-    expected,
-    p.signature,
-    network,
-  )
-  console.error(
-    `[auth47] rejected a proof from ${p.nym.slice(0, 12)}…: ${report.conclusion}`,
-  )
-  console.error(`[auth47]   expected notification address: ${expected}`)
-  if (report.headerByte !== undefined) {
-    console.error(`[auth47]   recovery header byte: ${report.headerByte}`)
-  }
-  if (report.recoveredStrict.length > 0) {
-    console.error(`[auth47]   signature recovers to: ${report.recoveredStrict.join(', ')}`)
-  }
-  console.error(`[auth47]   posted challenge:  ${p.challenge}`)
-  console.error(`[auth47]   we issued:         ${issuedUri ?? '(unknown — nonce not found)'}`)
-  console.error(
-    '[auth47]   diagnose a captured proof offline with: paynym-bot verify-proof <file>',
-  )
-}
-
 export function createStorefront(opts: StorefrontOptions): Server {
   const index = readFileSync(join(PUBLIC_DIR, 'index.html'))
   const qrScript = readFileSync(join(PUBLIC_DIR, 'js', 'qrcode.js'))
   const sessions = new Auth47Sessions()
-  const networkForAddress = (name: NetworkName): Network =>
-    name === 'mainnet'
-      ? // Local import to avoid a circular dependency on state.ts helpers.
-        { p2pkhVersion: 0x00, coinType: 0 }
-      : { p2pkhVersion: 0x6f, coinType: 1 }
-
   // The host the operator published this storefront as, if they configured
   // one. Everything auth47 does is bound to it; see StorefrontOptions.
   const publishedHost = opts.onionHost ? hostKey(opts.onionHost) : undefined
@@ -395,17 +342,15 @@ export function createStorefront(opts: StorefrontOptions): Server {
         return json(res, 401, { error: 'proof was signed for a different site' })
       }
 
-      // Structural + cryptographic check.
-      const v = verifyProof(proof, networkForAddress(opts.network))
+      // Structural + cryptographic check, delegated to the Samourai libraries.
+      const v = verifyProof(proof, `${origin}/api/auth47/callback`)
       if (!v.ok) {
-        // "bad signature" is a verdict, not a diagnosis, and the operator is
-        // the one who needs the diagnosis — a real wallet's proof being
-        // rejected is a bug in one of three specific places. Work out which,
-        // and log it. The WIRE response stays the single word: the wallet has
-        // no business being told which internal check failed.
-        if (v.error === 'bad signature') {
-          logSignatureFailure(proof, sessions.issued(nonce), networkForAddress(opts.network))
-        }
+        // Log enough for the operator to act on, including the challenge we
+        // actually issued for this nonce — a mismatch between that and what
+        // came back is the thing worth seeing.
+        console.error(`[auth47] rejected a proof: ${v.error}`)
+        console.error(`[auth47]   posted challenge: ${challenge}`)
+        console.error(`[auth47]   we issued:        ${sessions.issued(nonce) ?? '(nonce not found)'}`)
         return json(res, 401, { error: v.error })
       }
 

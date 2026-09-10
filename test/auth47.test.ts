@@ -1,32 +1,35 @@
-// Auth47 offline test: challenge construction, signature verification, and
-// the security properties the storefront relies on (relay binding, single-use
-// nonces, expiry). No network; a proof is built here exactly as Ashigaru would
-// build one (recoverable Bitcoin signed-message over the prepared challenge).
+// Auth47, verified against the Samourai libraries themselves.
+//
+// This suite exists in the shape it does because of one bug. The verification
+// here used to be hand-rolled, and it read the recovery flag off the WRONG END
+// of the signature: bitcoinjs-message emits `[header | r | s]`, and the code
+// read `[r | s | header]`. Every real wallet proof failed as "bad signature",
+// and this suite passed the whole time — because its own helper signed with the
+// same wrong layout it verified.
+//
+// So the rule now is: the wallet-facing bytes are produced by
+// @dojo-tools/bitcoinjs-message, never by a local reimplementation. A helper
+// that builds proofs the way this file wants them to look proves nothing.
 // Run: node --experimental-strip-types --no-warnings test/auth47.test.ts
 
 import { PaynymIdentity } from '../src/identity.ts'
 import { networkFor } from '../src/state.ts'
-import { p2pkhAddress, nodeFromPaymentCode } from '../src/bip47.ts'
 import {
   Auth47Sessions,
   challengeURI,
-  signedForm,
-  signedMessageBytes,
-  verifyProof,
-  verifySignedMessage,
-  sameResource,
+  libNetwork,
   newNonce,
-  NONCE_TTL_MS,
-  MAX_LIVE_NONCES,
-  explainSignature,
-  framedBytes,
+  notificationAddresses,
   notificationAddressOf,
-  proofCandidates,
-  signedFormEncoded,
+  sameResource,
+  signedForm,
+  verifyProof,
+  MAX_LIVE_NONCES,
+  NONCE_TTL_MS,
 } from '../src/auth47.ts'
-import type { Framing } from '../src/auth47.ts'
-import { secp256k1 } from '@noble/curves/secp256k1'
-import { sha256 } from '@noble/hashes/sha256'
+import { bitcoinMessageFactory } from '@dojo-tools/bitcoinjs-message'
+import * as bip47utils from '@dojo-tools/bip47/utils'
+import ecc from '@bitcoinerlab/secp256k1'
 
 const fromHex = (h: string) => Uint8Array.from(Buffer.from(h, 'hex'))
 
@@ -45,15 +48,28 @@ const BOB_SEED = fromHex(
 
 const network = networkFor('mainnet')
 const alice = PaynymIdentity.fromSeed(ALICE_SEED, network) // the customer/wallet
-const bob = PaynymIdentity.fromSeed(BOB_SEED, network) // the merchant/bot
+const bob = PaynymIdentity.fromSeed(BOB_SEED, network) // another wallet entirely
 
-// --- challenge construction ---------------------------------------------------
+const message = bitcoinMessageFactory(ecc)
+const MAINNET = bip47utils.networks.bitcoin
+
+/**
+ * Sign exactly as a wallet does: through the library, which owns the framing
+ * AND the signature layout. Nothing in this file constructs those bytes itself
+ * — that is the mistake this suite is here to make impossible.
+ */
+function walletSign(identity: PaynymIdentity, challenge: string): string {
+  const sig = message.sign(challenge, identity.identityPrivateKey(), true, MAINNET.messagePrefix)
+  return Buffer.from(sig).toString('base64')
+}
 
 const origin = 'http://shopexampleonion7charactersonion.onion'
 const callback = `${origin}/api/auth47/callback`
 const nonce = newNonce()
 const expires = Math.floor(Date.now() / 1000) + 300
 const fullUri = challengeURI(nonce, expires, callback, origin)
+
+// --- challenge construction ---------------------------------------------------
 
 assert('challenge URI carries c, e, and explicit r', (() => {
   const u = new URL(fullUri)
@@ -73,104 +89,108 @@ assert('signed form strips c and keeps r, e', (() => {
 })())
 assert('signed form nonce is intact', new URL(prepared).hostname === nonce)
 
-// --- proof construction, as a conforming wallet builds it ----------------------
-
-function signLikeAWallet(identity: PaynymIdentity, message: string): string {
-  const digest = sha256(sha256(signedMessageBytes(message)))
-  const sig = secp256k1.sign(digest, identity.identityPrivateKey())
-  const compact = sig.toBytes()
-  const out = new Uint8Array(65)
-  out.set(compact)
-  out[64] = sig.recovery + 31 // bitcoinjs-message header: 31..34 = compressed key
-  return Buffer.from(out).toString('base64')
+// --- the signature layout, pinned ---------------------------------------------
+//
+// The regression that started all this. A wallet signature is
+// [header | r | s]: the recovery flag is the FIRST byte, 27..34 for a P2PKH
+// key (27+recid uncompressed, 31+recid compressed). Reading it off the last
+// byte parses r's leading byte as the flag, which is why every genuine proof
+// was refused.
+{
+  const raw = Buffer.from(walletSign(alice, prepared), 'base64')
+  assert('a wallet signature is 65 bytes', raw.length === 65)
+  assert(
+    'the recovery flag is the FIRST byte, in 27..34',
+    raw[0]! >= 27 && raw[0]! <= 34,
+  )
+  assert(
+    'and the LAST byte is signature material, not a flag',
+    !(raw[64]! >= 27 && raw[64]! <= 34) || raw[0]! !== raw[64]!,
+  )
 }
+
+// --- a real proof verifies ------------------------------------------------------
 
 const proof = {
   auth47_response: '1.0',
   challenge: prepared,
-  signature: signLikeAWallet(alice, prepared),
+  signature: walletSign(alice, prepared),
   nym: alice.paymentCode(),
 }
 
-const v = verifyProof(proof, network)
-assert('a conforming proof verifies', v.ok)
+const v = verifyProof(proof, callback)
+assert('a wallet-shaped proof verifies', v.ok)
 assert('verified proof yields the payment code', v.ok && v.paymentCode === alice.paymentCode())
 
-// The signature must check against the nym's NOTIFICATION address.
-const notificationAddress = p2pkhAddress(
-  nodeFromPaymentCode(alice.paymentCode()).deriveChild(0).publicKey!,
-  network,
-)
-assert('notification address derived from the code is the verify target', (() => {
-  return verifySignedMessage(prepared, notificationAddress, proof.signature, network)
+// The address the signature recovers to is the payment code's notification
+// address, which is what binds the proof to the nym.
+assert('the notification address is what was signed from', (() => {
+  const addr = notificationAddressOf(alice.paymentCode(), 'bitcoin')
+  return message.verify(prepared, addr, proof.signature, MAINNET.messagePrefix)
 })())
 
 // --- rejections ---------------------------------------------------------------
 
-assert('wrong version rejected', !verifyProof({ ...proof, auth47_response: '2.0' }, network).ok)
-assert('malformed payload rejected', !verifyProof('nope', network).ok)
-assert('challenge still carrying c rejected', !verifyProof({
-  ...proof,
-  challenge: fullUri,
-}, network).ok)
-assert('expired challenge rejected', (() => {
-  const past = challengeURI(newNonce(), Math.floor(Date.now() / 1000) - 10, callback, origin)
-  return !verifyProof({
-    auth47_response: '1.0',
-    challenge: signedForm(past)!,
-    signature: signLikeAWallet(alice, signedForm(past)!),
-    nym: alice.paymentCode(),
-  }, network).ok
-})())
-assert('forged signature rejected', !verifyProof({ ...proof, signature: signLikeAWallet(bob, prepared) }, network).ok)
+assert('a proof signed by another wallet is rejected',
+  !verifyProof({ ...proof, signature: walletSign(bob, prepared) }, callback).ok)
+assert('a tampered challenge is rejected',
+  !verifyProof({ ...proof, challenge: prepared.replace(/r=[^&]*/, 'r=http://evil.onion') }, callback).ok)
+assert('malformed payload rejected', !verifyProof('nope', callback).ok)
+assert('wrong version rejected', !verifyProof({ ...proof, auth47_response: '2.0' }, callback).ok)
+assert('challenge still carrying c rejected', !verifyProof({ ...proof, challenge: fullUri }, callback).ok)
+assert('garbage nym rejected', !verifyProof({ ...proof, nym: 'not-a-payment-code' }, callback).ok)
 assert('address-only proof rejected (cannot identify a counterparty)', (() => {
   const withAddress = { ...proof } as Record<string, unknown>
   delete withAddress.nym
-  withAddress.address = notificationAddress
-  return !verifyProof(withAddress, network).ok
+  withAddress.address = notificationAddressOf(alice.paymentCode(), 'bitcoin')
+  return !verifyProof(withAddress, callback).ok
 })())
-assert('garbage nym rejected', !verifyProof({ ...proof, nym: 'not-a-payment-code' }, network).ok)
-assert('proof for a different challenge rejected', (() => {
-  const other = signedForm(challengeURI(newNonce(), expires, callback, origin))!
-  return !verifyProof({ ...proof, challenge: other }, network).ok
+assert('an expired challenge is rejected', (() => {
+  // Built by hand: the library's generateURI refuses to mint a past expiry at
+  // all, which is itself the right behaviour — but the verifier still has to
+  // refuse one that arrives from outside.
+  const past = `auth47://${newNonce()}?e=${Math.floor(Date.now() / 1000) - 10}&r=${origin}`
+  return !verifyProof({
+    auth47_response: '1.0',
+    challenge: past,
+    signature: walletSign(alice, past),
+    nym: alice.paymentCode(),
+  }, callback).ok
+})())
+assert('and generateURI refuses to mint one in the past', (() => {
+  try {
+    challengeURI(newNonce(), Math.floor(Date.now() / 1000) - 10, callback, origin)
+    return false
+  } catch {
+    return true
+  }
 })())
 
-// A payment code is network-agnostic: the notification key it names is the
-// same on every network, and verifyProof derives the expected address under
-// whichever network it is handed, so a valid proof verifies under both. This
-// is inherent to Auth47 (a code carries no network), and is fine here: the
-// proof establishes CONTROL of the code; which chain the customer is paid on
-// is fixed by the storefront's own network, and the address it serves is
-// derived on that network.
-assert('proof verifies under either network (the code is network-agnostic)', (() => {
-  const vTest = verifyProof(proof, networkFor('testnet'))
-  return vTest.ok && vTest.paymentCode === alice.paymentCode()
-})())
-
-// --- signed-message framing ----------------------------------------------------
-
-// The framing must be exactly bitcoinjs-message's: magic + varint + message.
+// --- both notification-address derivations are accepted -------------------------
+//
+// A PayNym is a mainnet identity, but a wallet in testnet mode signs from the
+// testnet derivation of the same code. Refusing that silently rejects good
+// proofs; Dojo Bay accepts either, and so do we. Both come from the same code.
 {
-  const msg = 'auth47://abc?e=1&r=http://x'
-  const bytes = signedMessageBytes(msg)
-  const expected = Buffer.concat([
-    // 0x18 control byte, then the literal, then varint length, then message.
-    Buffer.from('\x18Bitcoin Signed Message:\n', 'utf8'),
-    Buffer.from([Buffer.byteLength(msg)]),
-    Buffer.from(msg, 'utf8'),
-  ])
-  assert('signed-message framing matches bitcoinjs-message', Buffer.from(bytes).equals(expected))
+  const addrs = notificationAddresses(alice.paymentCode())
+  assert('a payment code yields two derivations', addrs.length === 2)
+  assert('they differ', addrs[0] !== addrs[1])
+  assert('mainnet form is a 1-address', addrs[0]!.startsWith('1'))
+  assert('testnet form is an m/n-address', /^[mn]/.test(addrs[1]!))
+  assert('libNetwork maps our names onto the library\'s',
+    libNetwork('mainnet') === 'bitcoin' && libNetwork('testnet') === 'testnet')
 }
 
 // --- resource binding ------------------------------------------------------------
 
 assert('same resource, different trailing slash, matches', sameResource(`${origin}/`, origin))
+assert('host case is not a different site', sameResource(origin.toUpperCase().replace('HTTP', 'http'), origin))
 assert('different origin does not match', !sameResource('http://evil.onion', origin))
+assert('a different path IS a different resource', !sameResource(`${origin}/other`, origin))
+assert('unparseable is equal to nothing', !sameResource('not a url', origin))
 
 // --- nonce / session store -------------------------------------------------------
 
-// The store keeps the issued URI for diagnostics; these cases only exercise
-// nonce lifecycle, so any well-formed challenge stands in for it.
 const forNonce = (n: string) => challengeURI(n, expires, callback, origin)
 
 const sessions = new Auth47Sessions()
@@ -184,7 +204,7 @@ assert('unknown nonce is rejected', sessions.take(n2) === null)
 
 const n3 = newNonce()
 sessions.issue(n3, forNonce(n3))
-const rec = sessions.take(n3)!
+sessions.take(n3)
 const sid = sessions.mint(alice.paymentCode())
 sessions.claim(n3, sid)
 assert('claimed nonce yields the session id', sessions.claimed(n3) === sid)
@@ -207,10 +227,7 @@ const sid5 = clockSessions.mint(alice.paymentCode())
 fakeNow += 12 * 60 * 60 * 1000 + 1
 assert('session expires with its TTL', clockSessions.session(sid5) === null)
 
-// --- the store cannot be grown without bound -----------------------------------
-// issue() is reached by an unauthenticated POST, and gc() only reclaims what
-// has actually expired, so the cap is the only thing standing between a POST
-// loop and unbounded memory.
+// The store cannot be grown without bound: issue() is unauthenticated.
 {
   const bounded = new Auth47Sessions()
   let issued = 0
@@ -220,17 +237,12 @@ assert('session expires with its TTL', clockSessions.session(sid5) === null)
   }
   assert('issue stops at the cap', issued === MAX_LIVE_NONCES)
   const overflow = newNonce()
-  assert(
-    'and says so, rather than growing quietly',
-    bounded.issue(overflow, forNonce(overflow)) === false,
-  )
+  assert('and says so, rather than growing quietly',
+    bounded.issue(overflow, forNonce(overflow)) === false)
 }
 
-// --- peek is the cheap gate, and does not consume ------------------------------
-// The nonce check has to come before signature verification, which costs an
-// ECDSA recovery on unauthenticated input. But peeking must not burn the
-// customer's challenge: a wallet that posts one malformed proof should still
-// be able to post a good one.
+// peek is the cheap gate in front of signature verification, and must not
+// consume: a malformed proof should not burn the customer's challenge.
 {
   const gate = new Auth47Sessions()
   const n = newNonce()
@@ -241,10 +253,7 @@ assert('session expires with its TTL', clockSessions.session(sid5) === null)
   assert('peek is false for an unknown nonce', !gate.peek(newNonce()))
 }
 
-// --- a replayed proof must not destroy the real customer's session -------------
-// take() leaves a consumed record in place precisely so the session id it
-// carries survives until the browser polls for it. Deleting it here would let
-// a replay — or a wallet that merely retried — cancel the legitimate login.
+// A replayed proof must not destroy the real customer's pending session.
 {
   const st = new Auth47Sessions()
   const n = newNonce()
@@ -256,9 +265,7 @@ assert('session expires with its TTL', clockSessions.session(sid5) === null)
   assert('but the pending session survives the replay', st.claimed(n) === sessionId)
 }
 
-// --- the session is claimed once ----------------------------------------------
-// The nonce is the payload of the QR on the customer's screen, so an onlooker
-// who photographs it must not be able to poll for the session behind them.
+// The session is claimed once: the nonce is the QR on the customer's screen.
 {
   const once = new Auth47Sessions()
   const n = newNonce()
@@ -270,133 +277,9 @@ assert('session expires with its TTL', clockSessions.session(sid5) === null)
   assert('a second claim gets nothing', once.claimed(n) === null)
 }
 
-// --- the diagnostic names the cause -------------------------------------------
-//
-// "bad signature" is a verdict, not a diagnosis, and there are exactly three
-// plausible causes when a real wallet's proof is rejected. These pin that each
-// one is NAMED rather than collapsed into the same word — which is the whole
-// reason this machinery exists, after the same bug was declared fixed once on
-// a guess.
-
-/** Sign under a chosen framing and header offset, as a misbehaving wallet would. */
-function signAs(
-  identity: PaynymIdentity,
-  message: string,
-  framing: Framing = 'bitcoin',
-  headerOffset = 31,
-): string {
-  const digest = sha256(sha256(framedBytes(message, framing)!))
-  const sig = secp256k1.sign(digest, identity.identityPrivateKey())
-  const out = new Uint8Array(65)
-  out.set(sig.toBytes())
-  out[64] = sig.recovery + headerOffset
-  return Buffer.from(out).toString('base64')
-}
-
-const expectedAddress = notificationAddressOf(alice.paymentCode(), network)
-
-// (c) framing: the 0x18 control byte omitted — the bug 8eef733 claimed to fix.
-{
-  const report = explainSignature(
-    proofCandidates(prepared),
-    expectedAddress,
-    signAs(alice, prepared, 'no-control-byte'),
-    network,
-  )
-  assert('framing mismatch is not accepted', !report.strictOk)
-  assert(
-    'framing mismatch is NAMED as the missing control byte',
-    report.matches.some((m) => m.framing === 'no-control-byte'),
-  )
-  assert('and the conclusion says so in words', /0x18/.test(report.conclusion))
-}
-
-// (b) wrong key: a valid signature by someone else over the right challenge.
-{
-  const report = explainSignature(
-    proofCandidates(prepared),
-    expectedAddress,
-    signAs(bob, prepared),
-    network,
-  )
-  assert('a signature by another key is not accepted', !report.strictOk)
-  assert('nothing in the matrix reproduces the nym', report.matches.length === 0)
-  assert(
-    'the report says which key it WAS',
-    report.recoveredStrict.length > 0 && !report.recoveredStrict.includes(expectedAddress),
-  )
-  assert('and calls it a key problem', /wrong key|other than/.test(report.conclusion))
-}
-
-// (a) serialization: signs the percent-encoded form, posts the decoded one.
-// Caught without knowing the issued URI, by re-serialising what was posted.
-{
-  const encoded = signedFormEncoded(fullUri)!
-  const report = explainSignature(
-    proofCandidates(prepared),
-    expectedAddress,
-    signAs(alice, encoded),
-    network,
-  )
-  assert('a serialization mismatch is not accepted', !report.strictOk)
-  assert(
-    'the serialization mismatch is NAMED, with no issued URI needed',
-    report.matches.some((m) => /re-encoded/.test(m.label) && m.framing === 'bitcoin'),
-  )
-}
-
-// A valid proof still reports valid, so the diagnostic agrees with the verifier.
-{
-  const report = explainSignature(
-    proofCandidates(prepared),
-    expectedAddress,
-    proof.signature,
-    network,
-  )
-  assert('a good signature is reported valid', report.strictOk && report.conclusion === 'valid')
-}
-
-// Shape problems get their own answers rather than a crypto verdict.
-{
-  const der = Buffer.from(
-    secp256k1.sign(sha256(sha256(signedMessageBytes(prepared))), alice.identityPrivateKey()).toDERRawBytes(),
-  ).toString('base64')
-  const report = explainSignature(proofCandidates(prepared), expectedAddress, der, network)
-  assert('a DER signature is called out by length', report.problem === 'not 65 bytes')
-  assert('and named as the likely mix-up', /DER/.test(report.conclusion))
-
-  const badHeader = explainSignature(
-    proofCandidates(prepared),
-    expectedAddress,
-    signAs(alice, prepared, 'bitcoin', 99),
-    network,
-  )
-  assert('an out-of-range header byte is called out', badHeader.problem === 'header out of range')
-  assert(
-    'and the report notes the signature was otherwise fine',
-    /otherwise valid/.test(badHeader.conclusion),
-  )
-}
-
-// The varint ceiling is its own error, not "bad signature": the throw inside
-// signedMessageBytes used to be swallowed and reported as a crypto failure.
-{
-  const longResource = `http://${'x'.repeat(240)}.onion`
-  const longUri = signedForm(challengeURI(newNonce(), expires, callback, longResource))!
-  assert('an over-long challenge is over the varint ceiling', longUri.length > 252)
-  const v = verifyProof(
-    { auth47_response: '1.0', challenge: longUri, signature: proof.signature, nym: alice.paymentCode() },
-    network,
-  )
-  assert(
-    'and it reports its own error, not "bad signature"',
-    !v.ok && v.error === 'challenge too long',
-  )
-}
-
 console.log('')
 if (failures === 0) {
-  console.log('PASS — auth47 challenges build, proofs verify, and attacks fail closed.')
+  console.log('PASS — auth47 verified through the Samourai libraries, signature layout pinned.')
 } else {
   console.log(`FAIL — ${failures} auth47 check(s) failed.`)
   process.exit(1)

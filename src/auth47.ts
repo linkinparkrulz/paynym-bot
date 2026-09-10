@@ -1,34 +1,32 @@
 // Auth47: authenticate a customer with their BIP47 payment code, then hand
-// them a receive address over the storefront — the flow the storefront was
-// missing. A stock BIP47 wallet (Samourai/Ashigaru) scans a challenge QR, signs
-// it with the payment code's notification key, and POSTs the proof back; we
-// verify it and mint a session that can be shown an address.
+// them a receive address over the storefront. A stock BIP47 wallet
+// (Samourai/Ashigaru) scans a challenge QR, signs it with the payment code's
+// notification key, and POSTs the proof back; we verify it and mint a session
+// that can be shown an address.
 //
-// Grounded in the Auth47 specification (Dojo-Open-Source-Project/
-// auth47-specification) and shaped on Dojo Bay's deployment of it, which is the
-// implementation Ashigaru and Samourai wallets demonstrably interoperate with:
+// The verification is NOT implemented here. It is delegated to the Samourai
+// libraries — @dojo-tools/auth47, @dojo-tools/bip47, @dojo-tools/bitcoinjs-message
+// — which is what The Dojo Bay does (see its server/crypto.ts, "thin wrappers
+// over the audited Samourai libraries"), and they are the implementations
+// Ashigaru and Samourai demonstrably interoperate with.
 //
-//   - The challenge is `auth47://<nonce>?c=<callback>&e=<unix>&r=<resource>`,
-//     fully percent-decoded, with r and e ALWAYS explicit rather than relying
-//     on the spec's implicit `r = c` rule.
-//   - The wallet signs the challenge WITHOUT the c parameter (spec's challenge
-//     preparation: inject r, strip c).
-//   - The signature is a base64 Bitcoin signed message (recoverable), and it
-//     is verified against the NOTIFICATION ADDRESS derived from the submitted
-//     payment code — not by recovering a public key — which is exactly the
-//     shape @dojo-tools/auth47 and Dojo Bay use.
-//   - The resource `r` must name this storefront (relay binding): a proof
-//     minted for another site must not authenticate here, even though its
-//     signature is valid.
+// That delegation is the whole point, and it was learned the hard way. This
+// file previously hand-rolled the signed-message framing and the signature
+// decode, and got the signature layout backwards: bitcoinjs-message emits
+// `[header | r | s]`, with the recovery flag as the FIRST byte, and this code
+// read it as `[r | s | header]`. Every real wallet proof failed as "bad
+// signature". The test suite passed throughout, because its helper signed with
+// the same wrong layout it verified — self-consistent, and wrong.
 //
-// Dojo Bay hard-codes mainnet in its Auth47 path; we thread the network from
-// the state file so a testnet deployment verifies against testnet addresses.
+// So: no bespoke crypto on this path. If something here disagrees with a
+// wallet, the fix belongs in the library, not in a local reimplementation of it.
 
 import { randomBytes } from 'node:crypto'
-import { secp256k1 } from '@noble/curves/secp256k1'
-import { sha256 } from '@noble/hashes/sha256'
-import { nodeFromPaymentCode, p2pkhAddress } from './bip47.ts'
-import type { Network } from './bip47.ts'
+import { Auth47Verifier } from '@dojo-tools/auth47'
+import { BIP47Factory } from '@dojo-tools/bip47'
+import * as bip47utils from '@dojo-tools/bip47/utils'
+import ecc from '@bitcoinerlab/secp256k1'
+import type { NetworkName } from './state.ts'
 
 export const AUTH47_RESPONSE_VERSION = '1.0'
 
@@ -46,366 +44,41 @@ export const SESSION_TTL_MS = 12 * 60 * 60 * 1000
  */
 export const MAX_LIVE_NONCES = 4096
 
-/**
- * Bitcoin signed-message prefix, exactly as bitcoinjs-message defines it:
- * a literal 0x18 control byte, then "Bitcoin Signed Message:\n". The 0x18 is
- * load-bearing — omit it and the digest differs, pubkey recovery lands on a
- * different key, and every real wallet signature fails as "bad signature".
- */
-const MESSAGE_MAGIC = '\x18Bitcoin Signed Message:\n'
-
-function textEncoder(): TextEncoder {
-  return new TextEncoder()
-}
+const bip47 = BIP47Factory(ecc)
 
 /**
- * The exact bytes a wallet signs for a message: magic, varint length, message.
- * Matches bitcoinjs-message's format for messages under 253 bytes (an auth47
- * challenge always is).
- */
-export function signedMessageBytes(message: string): Uint8Array {
-  const msg = textEncoder().encode(message)
-  if (msg.length >= 253) throw new Error('message too long for varint length prefix')
-  const magic = textEncoder().encode(MESSAGE_MAGIC)
-  const out = new Uint8Array(magic.length + 1 + msg.length)
-  out.set(magic)
-  out[magic.length] = msg.length
-  out.set(msg, magic.length + 1)
-  return out
-}
-
-/** Double-SHA256 digest over the signed-message framing. */
-function messageDigest(message: string): Uint8Array {
-  return sha256(sha256(signedMessageBytes(message)))
-}
-
-/** The longest message the single-byte varint length prefix can describe. */
-export const MAX_SIGNED_MESSAGE_BYTES = 252
-
-// --- Diagnostics --------------------------------------------------------------
-//
-// Everything below exists for one reason: "bad signature" is a verdict, not a
-// diagnosis. When a real wallet's proof is rejected there are only a few
-// possible causes, and they are distinguishable — but only if we actually go
-// and look. So on failure we re-run the recovery across every framing a wallet
-// might plausibly have used, every candidate string it might plausibly have
-// signed, and every recovery id, and report which combination (if any)
-// reproduces the key the payment code names. One match names the bug.
-//
-// This is not used to decide whether to accept a proof. `verifyProof` remains
-// strict: the correct framing, over the string the wallet actually posted.
-
-/**
- * Framings a Bitcoin signed message might have been built with. Only `bitcoin`
- * is correct; the others are the three ways implementations get it wrong, kept
- * here so a mismatch can be named instead of guessed at.
- */
-export type Framing =
-  /** magic 0x18, "Bitcoin Signed Message:\n", varint length, message. */
-  | 'bitcoin'
-  /** The same, with the load-bearing 0x18 control byte omitted. */
-  | 'no-control-byte'
-  /** Magic and message, but no length prefix. */
-  | 'no-length-prefix'
-  /** The message alone, double-hashed with no framing at all. */
-  | 'unframed'
-
-export const FRAMINGS: readonly Framing[] = [
-  'bitcoin',
-  'no-control-byte',
-  'no-length-prefix',
-  'unframed',
-]
-
-/** Human-readable account of what each framing does, for the report. */
-export function describeFraming(framing: Framing): string {
-  switch (framing) {
-    case 'bitcoin':
-      return 'the standard framing (0x18, magic, varint length, message)'
-    case 'no-control-byte':
-      return 'the magic WITHOUT the leading 0x18 control byte'
-    case 'no-length-prefix':
-      return 'the magic with no varint length prefix'
-    case 'unframed':
-      return 'the bare message, with no signed-message framing at all'
-  }
-}
-
-/** Bytes to hash under a given framing, or null when it cannot be expressed. */
-export function framedBytes(message: string, framing: Framing): Uint8Array | null {
-  const msg = textEncoder().encode(message)
-  if (framing === 'unframed') return msg
-  const magic = textEncoder().encode(
-    framing === 'no-control-byte' ? MESSAGE_MAGIC.slice(1) : MESSAGE_MAGIC,
-  )
-  if (framing === 'no-length-prefix') {
-    const out = new Uint8Array(magic.length + msg.length)
-    out.set(magic)
-    out.set(msg, magic.length)
-    return out
-  }
-  if (msg.length > MAX_SIGNED_MESSAGE_BYTES) return null
-  const out = new Uint8Array(magic.length + 1 + msg.length)
-  out.set(magic)
-  out[magic.length] = msg.length
-  out.set(msg, magic.length + 1)
-  return out
-}
-
-/** A candidate string the wallet might have signed, with a label for the report. */
-export type Candidate = { label: string; message: string }
-
-/** One combination that reproduced the expected address. */
-export type SignatureMatch = {
-  label: string
-  framing: Framing
-  recovery: 0 | 1 | 2 | 3
-  compressed: boolean
-}
-
-export type SignatureProblem =
-  | 'not base64'
-  | 'not 65 bytes'
-  | 'header out of range'
-  | 'no match'
-
-export type SignatureReport = {
-  /** True when the strict check — standard framing, posted message — passes. */
-  strictOk: boolean
-  problem?: SignatureProblem
-  signatureBytes?: number
-  headerByte?: number
-  expectedAddress: string
-  /** Every framing/message/recovery combination that reproduced it. */
-  matches: SignatureMatch[]
-  /**
-   * Addresses the signature recovers to under the STRICT framing of the first
-   * candidate, for all four recovery ids. When nothing matches, this is what
-   * the signer's key actually was — which settles whether the wallet signed
-   * with the wrong key or merely framed the message differently.
-   */
-  recoveredStrict: string[]
-  /** One sentence naming the cause, for a log line or the CLI. */
-  conclusion: string
-}
-
-/**
- * Diagnose a signature: which framing, over which candidate string, with which
- * recovery id, reproduces `expectedAddress` — if any.
+ * The networks a proof is checked against.
  *
- * `candidates[0]` must be the string the wallet actually posted; the strict
- * check and `recoveredStrict` are both relative to it.
+ * Both, always, and the reason is Dojo Bay's: a PayNym is a mainnet identity,
+ * but a wallet running in testnet mode derives the notification address for
+ * THAT network, so the same payment code signs from a different address
+ * depending on which mode the customer's wallet happens to be in. Insisting on
+ * one derivation silently refuses perfectly good proofs. Accepting either is no
+ * weaker — both addresses come from the same payment code, and it is that code
+ * the proof binds to.
  */
-export function explainSignature(
-  candidates: readonly Candidate[],
-  expectedAddress: string,
-  signatureBase64: string,
-  network: Network,
-): SignatureReport {
-  const base: Omit<SignatureReport, 'conclusion'> = {
-    strictOk: false,
-    expectedAddress,
-    matches: [],
-    recoveredStrict: [],
-  }
-
-  let compact: Uint8Array
-  try {
-    const raw = Buffer.from(signatureBase64, 'base64')
-    if (raw.length !== 65) {
-      return {
-        ...base,
-        problem: 'not 65 bytes',
-        signatureBytes: raw.length,
-        conclusion:
-          `the signature decoded to ${raw.length} bytes, not 65 — this is not a ` +
-          `recoverable Bitcoin signed-message signature (a DER signature is a common mix-up)`,
-      }
-    }
-    compact = Uint8Array.from(raw)
-  } catch {
-    return { ...base, problem: 'not base64', conclusion: 'the signature is not valid base64' }
-  }
-
-  const headerByte = compact[64]!
-  let sig: ReturnType<typeof secp256k1.Signature.fromCompact>
-  try {
-    sig = secp256k1.Signature.fromCompact(compact.subarray(0, 64))
-  } catch {
-    return {
-      ...base,
-      headerByte,
-      problem: 'not 65 bytes',
-      conclusion: 'the 64 signature bytes are not a valid (r, s) pair on secp256k1',
-    }
-  }
-
-  // Recover under every framing and candidate, ignoring the header byte's
-  // claims: a wrong header is itself one of the things worth catching.
-  const matches: SignatureMatch[] = []
-  const recoveredStrict: string[] = []
-  for (const candidate of candidates) {
-    for (const framing of FRAMINGS) {
-      const bytes = framedBytes(candidate.message, framing)
-      if (bytes === null) continue
-      const digest = sha256(sha256(bytes))
-      for (const recovery of [0, 1, 2, 3] as const) {
-        let pub: ReturnType<typeof sig.recoverPublicKey>
-        try {
-          pub = sig.addRecoveryBit(recovery).recoverPublicKey(digest)
-        } catch {
-          continue // not every recovery id yields a point
-        }
-        for (const compressed of [true, false]) {
-          const address = p2pkhAddress(pub.toRawBytes(compressed), network)
-          if (
-            candidate === candidates[0] &&
-            framing === 'bitcoin' &&
-            compressed &&
-            !recoveredStrict.includes(address)
-          ) {
-            recoveredStrict.push(address)
-          }
-          if (address === expectedAddress) {
-            matches.push({ label: candidate.label, framing, recovery, compressed })
-          }
-        }
-      }
-    }
-  }
-
-  const strictOk = matches.some(
-    (m) =>
-      m.label === candidates[0]?.label &&
-      m.framing === 'bitcoin' &&
-      m.recovery === ((headerByte - 27) & 3) &&
-      m.compressed === headerByte >= 31,
-  )
-
-  if (headerByte < 27 || headerByte > 34) {
-    return {
-      ...base,
-      headerByte,
-      matches,
-      recoveredStrict,
-      problem: 'header out of range',
-      conclusion:
-        `the recovery header byte is ${headerByte}; a Bitcoin signed message uses 27..34 ` +
-        `(27+recid uncompressed, 31+recid compressed)` +
-        (matches.length > 0
-          ? `. The signature IS otherwise valid: ${summarise(matches[0]!)}`
-          : ''),
-    }
-  }
-
-  if (strictOk) {
-    return { ...base, strictOk: true, headerByte, matches, recoveredStrict, conclusion: 'valid' }
-  }
-
-  if (matches.length === 0) {
-    return {
-      ...base,
-      headerByte,
-      matches,
-      recoveredStrict,
-      problem: 'no match',
-      conclusion:
-        `no framing of any candidate string recovers to ${expectedAddress}. The signature ` +
-        `recovers to ${recoveredStrict.join(' or ')} instead, so it was made by a key ` +
-        `other than this payment code's notification key — the wallet signed with the ` +
-        `wrong key, or the nym does not belong to the signer`,
-    }
-  }
-
-  return {
-    ...base,
-    headerByte,
-    matches,
-    recoveredStrict,
-    problem: 'no match',
-    conclusion: `the signature is valid, but not over what was posted: ${summarise(matches[0]!)}`,
-  }
-}
-
-function summarise(m: SignatureMatch): string {
-  return (
-    `it verifies over "${m.label}" using ${describeFraming(m.framing)}, ` +
-    `recovery id ${m.recovery}, ${m.compressed ? 'compressed' : 'uncompressed'} key`
-  )
-}
-
-/**
- * Verify a base64 recoverable Bitcoin signed-message signature against the
- * P2PKH address it claims to come from. Recovery rather than pubkey-verify is
- * required: the wallet hands us a 65-byte [r | s | header] compact signature
- * and no public key.
- *
- * The header byte encodes the recovery id and key length as bitcoinjs-message
- * and every wallet produces them: `27 + recid` for an uncompressed public key
- * (27..30), `27 + recid + 4` for a compressed one (31..34, which is what
- * Ashigaru and Samourai emit, since BIP47 keys are compressed). The recovery
- * bit masked out is still the low two bits either way.
- */
-export function verifySignedMessage(
-  message: string,
-  address: string,
-  signatureBase64: string,
-  network: Network,
-): boolean {
-  let compact: Uint8Array
-  try {
-    const raw = Buffer.from(signatureBase64, 'base64')
-    // 65 bytes is the only shape this format has: 32 r + 32 s + 1 header.
-    // Anything else is not a recoverable signature in it.
-    if (raw.length !== 65) return false
-    compact = Uint8Array.from(raw)
-  } catch {
-    return false
-  }
-  const header = compact[64]
-  if (header < 27 || header > 34) return false
-  try {
-    const digest = messageDigest(message)
-    const sig = secp256k1.Signature.fromCompact(compact.subarray(0, 64))
-    const recovery = (header - 27) & 3
-    const compressed = header >= 31
-    const pub = sig.addRecoveryBit(recovery as 0 | 1 | 2 | 3).recoverPublicKey(digest)
-    // The address hashes whichever key length the header declared: compressed
-    // keys hash their 33 bytes, uncompressed theirs 65.
-    return p2pkhAddress(pub.toRawBytes(compressed), network) === address
-  } catch {
-    return false
-  }
-}
+const VERIFY_NETWORKS = ['bitcoin', 'testnet'] as const
 
 // --- Challenge construction -------------------------------------------------
 
-/**
- * Build the URI shown to the wallet (QR / link). `callbackUrl` lands in `c`,
- * and `resource` in `r` — both explicit, always, per Dojo Bay: the implicit
- * `r = c` rule of the spec relies on wallet behaviour we need not trust.
- *
- * The URI is emitted fully percent-decoded (URL.toString() would escape ':'
- * and '&'), because that is the byte sequence wallets expect to sign.
- */
+/** Build the URI shown to the wallet (QR / link), via the library's builder. */
 export function challengeURI(
   nonce: string,
   expiresUnix: number,
   callbackUrl: string,
   resource: string,
 ): string {
-  const params = [
-    `c=${callbackUrl}`,
-    `e=${expiresUnix}`,
-    `r=${resource}`,
-  ]
-  return `auth47://${nonce}?${params.join('&')}`
+  return new Auth47Verifier(ecc, callbackUrl).generateURI({
+    nonce,
+    expires: expiresUnix,
+    resource,
+  })
 }
 
 /**
- * The challenge preparation of the spec, reproduced: this is the string the
- * wallet signs — the URI with the c parameter stripped (r is already present).
- * Used by tests to build proofs and by verify to cross-check what was signed.
+ * The challenge preparation of the spec: the URI with the c parameter stripped
+ * (r is already present). This is the string the wallet signs and echoes back.
+ * Identical to Dojo Bay's signedForm.
  */
 export function signedForm(uri: string): string | null {
   try {
@@ -417,55 +90,27 @@ export function signedForm(uri: string): string | null {
   }
 }
 
-/**
- * The prepared form as a WHATWG URL serialises it — query values
- * percent-encoded (`r=http%3A%2F%2F…`). The spec says nothing about encoding,
- * so a wallet built on a URI builder rather than string concatenation will
- * arrive at this instead of the decoded form. Kept as a diagnostic candidate:
- * a signature that verifies over this but was posted as the decoded form is a
- * serialization mismatch, and that is worth being able to say out loud.
- */
-export function signedFormEncoded(uri: string): string | null {
-  try {
-    const u = new URL(uri)
-    u.searchParams.delete('c')
-    return u.toString()
-  } catch {
-    return null
-  }
-}
-
 /** The address a payment code's challenge signature must recover to. */
-export function notificationAddressOf(paymentCode: string, network: Network): string {
-  return p2pkhAddress(nodeFromPaymentCode(paymentCode).deriveChild(0).publicKey!, network)
+export function notificationAddressOf(
+  paymentCode: string,
+  network: 'bitcoin' | 'testnet' = 'bitcoin',
+): string {
+  return bip47.fromBase58(paymentCode, bip47utils.networks[network]).getNotificationAddress()
 }
 
 /**
- * Every string a wallet might plausibly have signed for this proof, with the
- * POSTED challenge first — the strict check is relative to it.
- *
- * `issuedUri`, when known, is the challenge we minted for this nonce. Having
- * it is what lets the diagnostic distinguish "signed a different serialization
- * of our challenge" from "signed something we never issued".
+ * Every address a payment code could legitimately have signed from. See
+ * VERIFY_NETWORKS. Lifted from Dojo Bay's notificationAddresses.
  */
-export function proofCandidates(
-  postedChallenge: string,
-  issuedUri?: string,
-): Candidate[] {
-  const out: Candidate[] = [{ label: 'the challenge as posted', message: postedChallenge }]
-  const push = (label: string, message: string | null): void => {
-    if (message !== null && !out.some((c) => c.message === message)) out.push({ label, message })
-  }
-  // Re-serialise the POSTED challenge both ways. This catches the mismatch
-  // even when the issued URI is unknown — a wallet that signs one
-  // serialization and posts the other has posted enough for us to reconstruct
-  // the form it signed, since only the encoding differs.
-  push('the posted challenge, re-encoded (percent-encoded query)', signedFormEncoded(postedChallenge))
-  push('the posted challenge with c stripped', signedForm(postedChallenge))
-  if (issuedUri !== undefined) {
-    push('our issued challenge, prepared and percent-decoded', signedForm(issuedUri))
-    push('our issued challenge, prepared and percent-encoded', signedFormEncoded(issuedUri))
-    push('our issued challenge verbatim, c and all', issuedUri)
+export function notificationAddresses(paymentCode: string): string[] {
+  const out: string[] = []
+  for (const net of VERIFY_NETWORKS) {
+    try {
+      const a = notificationAddressOf(paymentCode, net)
+      if (!out.includes(a)) out.push(a)
+    } catch {
+      /* skip a network this code cannot be decoded for */
+    }
   }
   return out
 }
@@ -485,98 +130,60 @@ export type Auth47Proof = {
   address?: string
 }
 
-export type VerifyError =
-  | 'malformed'
-  | 'bad version'
-  | 'bad challenge'
-  | 'bad payment code'
-  | 'bad signature'
-  | 'challenge too long'
-  | 'expired'
-
 export type VerifyResult =
   | { ok: true; paymentCode: string }
-  | { ok: false; error: VerifyError }
+  | { ok: false; error: string }
 
 /**
- * Validate a proof in full, except for nonce/relay concerns the caller owns
- * (the nonce store and the r-binding are per-deployment state, this function
- * is pure). Checks:
+ * Validate a proof, except for the nonce and relay concerns the caller owns
+ * (both are per-deployment state; this function is pure).
  *
- *   - payload shape and auth47_response === "1.0"
- *   - the challenge is a well-formed auth47 URI whose query carries r and
- *     does NOT carry c (a wallet signs the prepared form; a proof whose
- *     challenge still has c was not produced by a conforming wallet)
- *   - expiry: e, if present, is in the future
- *   - the nym decodes as a BIP47 payment code (address-only proofs are
- *     rejected: an address cannot identify a counterparty for BIP47)
- *   - the signature recovers to the notification address of that nym
+ * The signature check is the library's, run against both notification-address
+ * derivations. Everything this adds on top is a policy decision the library
+ * cannot make for us: that an address-only proof cannot name a BIP47
+ * counterparty, and that the callback parameter must already be stripped.
  */
-export function verifyProof(
-  proof: unknown,
-  network: Network,
-  now = Date.now(),
-): VerifyResult {
+export function verifyProof(proof: unknown, callbackUrl: string): VerifyResult {
   if (proof === null || typeof proof !== 'object') return { ok: false, error: 'malformed' }
   const p = proof as Partial<Auth47Proof>
 
-  if (p.auth47_response !== AUTH47_RESPONSE_VERSION) return { ok: false, error: 'bad version' }
-  if (typeof p.challenge !== 'string' || typeof p.signature !== 'string') {
-    return { ok: false, error: 'malformed' }
-  }
-  if (typeof p.nym !== 'string') {
-    // An address proof is spec-valid but cannot name a BIP47 counterparty.
-    return { ok: false, error: 'bad payment code' }
+  if (typeof p.nym !== 'string' || p.nym.length === 0) {
+    // Spec-valid, but an address cannot identify a BIP47 counterparty: there is
+    // no payment code to derive a receive address from.
+    return { ok: false, error: 'proof does not carry a payment code' }
   }
 
-  let challenge: URL
-  try {
-    if (!p.challenge.startsWith('auth47:')) throw new Error()
-    challenge = new URL(p.challenge)
-  } catch {
-    return { ok: false, error: 'bad challenge' }
+  const verifier = new Auth47Verifier(ecc, callbackUrl)
+  let lastError = 'invalid signature'
+  for (const network of VERIFY_NETWORKS) {
+    const res = verifier.verifyProof(proof as Auth47Proof, network)
+    if (res.result === 'ok') return { ok: true, paymentCode: p.nym }
+    lastError = res.error
   }
-  if (challenge.protocol !== 'auth47:') return { ok: false, error: 'bad challenge' }
-  if (!/^[a-zA-Z0-9]+$/.test(challenge.hostname)) return { ok: false, error: 'bad challenge' }
-  if (challenge.hash) return { ok: false, error: 'bad challenge' }
-  if (challenge.searchParams.get('c') !== null) return { ok: false, error: 'bad challenge' }
-  const r = challenge.searchParams.get('r')
-  if (!r) return { ok: false, error: 'bad challenge' }
-  const e = challenge.searchParams.get('e')
-  if (e !== null) {
-    const when = Number(e)
-    if (!Number.isInteger(when) || when * 1000 <= now) return { ok: false, error: 'expired' }
-  }
-  // Its own error, not "bad signature". signedMessageBytes throws past the
-  // single-byte varint, and that throw used to be swallowed by
-  // verifySignedMessage's catch — reporting a length problem as a crypto one,
-  // which is the sort of thing that costs an afternoon.
-  if (textEncoder().encode(p.challenge).length > MAX_SIGNED_MESSAGE_BYTES) {
-    return { ok: false, error: 'challenge too long' }
-  }
-
-  // The nym must decode; nodeFromPaymentCode throws on any malformed code.
-  let notificationAddress: string
-  try {
-    const node = nodeFromPaymentCode(p.nym)
-    notificationAddress = p2pkhAddress(node.deriveChild(0).publicKey!, network)
-  } catch {
-    return { ok: false, error: 'bad payment code' }
-  }
-
-  if (!verifySignedMessage(p.challenge, notificationAddress, p.signature, network)) {
-    return { ok: false, error: 'bad signature' }
-  }
-  return { ok: true, paymentCode: p.nym }
+  return { ok: false, error: lastError }
 }
 
-/** Compare two http(s) resources as Dojo Bay does: origin-normalised. */
+/**
+ * Two URLs naming the same resource, compared as parsed URLs so a trailing
+ * slash or a difference in host case is not a different site, while a different
+ * origin or path is. Anything that does not parse equals nothing. Dojo Bay's
+ * comparison, which is stricter than matching origins alone.
+ */
 export function sameResource(a: string, b: string): boolean {
   try {
-    return new URL(a).origin === new URL(b).origin
+    const norm = (u: string) => {
+      const x = new URL(u)
+      return x.origin.toLowerCase() + x.pathname.replace(/\/+$/, '') + x.search
+    }
+    return norm(a) === norm(b)
   } catch {
-    return a === b
+    return false
   }
+}
+
+/** Map our stored network name onto the library's. */
+export function libNetwork(name: NetworkName): 'bitcoin' | 'testnet' {
+  return name === 'mainnet' ? 'bitcoin' : 'testnet'
 }
 
 // --- Nonce and session stores ------------------------------------------------

@@ -41,14 +41,7 @@ import {
 } from '../src/seed.ts'
 import { assertIndexerAllowed, isOnion, loadConfig, proxyFor } from '../src/config.ts'
 import { createStorefront } from '../src/server.ts'
-import {
-  AUTH47_RESPONSE_VERSION,
-  describeFraming,
-  explainSignature,
-  notificationAddressOf,
-  proofCandidates,
-  verifyProof,
-} from '../src/auth47.ts'
+import { notificationAddresses, verifyProof } from '../src/auth47.ts'
 import {
   assertNetworkMatches,
   isNetworkName,
@@ -69,6 +62,7 @@ const { values, positionals } = parseArgs({
     passphrase: { type: 'string' },
     force: { type: 'boolean', default: false },
     challenge: { type: 'string' },
+    callback: { type: 'string' },
   },
 })
 
@@ -477,28 +471,25 @@ async function doctor(): Promise<void> {
 }
 
 /**
- * Diagnose a captured Auth47 proof offline.
+ * Check a captured Auth47 proof offline.
  *
- * "bad signature" has exactly three plausible causes — the wallet signed a
- * different serialization of the challenge than it posted, it signed with the
- * wrong key, or its message framing disagrees with ours — and they are
- * distinguishable if you actually look. This looks: it re-runs the recovery
- * across every framing, every candidate string and all four recovery ids, and
- * says which combination (if any) reproduces the key the payment code names.
+ * Runs the same check the storefront runs — the Samourai libraries, against
+ * both notification-address derivations — and prints the library's own error
+ * when it fails. Reads a file, or JSON on stdin.
  *
- * Usage:
- *   paynym-bot verify-proof proof.json
- *   pbpaste | paynym-bot verify-proof
- *
- * The proof is the JSON body the wallet POSTs to the callback:
- *   { "auth47_response": "1.0", "challenge": "auth47://…", "signature": "…", "nym": "PM8T…" }
- *
- * Pass --challenge to supply the URI the storefront issued, when you have it
- * from the log: knowing what we sent is what separates "signed a different
- * serialization of OUR challenge" from "signed something we never issued".
+ *   paynym-bot verify-proof proof.json --callback http://shop.onion/api/auth47/callback
+ *   pbpaste | paynym-bot verify-proof --callback ...
  */
 async function verifyProofCommand(): Promise<void> {
   const source = positionals[1]
+  if (source !== undefined && !existsSync(source)) {
+    die(
+      `no such file: ${source}\n\n` +
+        `   Pass the JSON body the wallet POSTs to the callback, or pipe it on stdin.\n` +
+        `   The service logs a rejected proof and the challenge it issued:\n` +
+        `     journalctl -u paynym-bot | grep auth47`,
+    )
+  }
   const raw = source
     ? readFileSync(source, 'utf8')
     : await new Promise<string>((resolve, reject) => {
@@ -519,119 +510,43 @@ async function verifyProofCommand(): Promise<void> {
     die(`that is not valid JSON: ${(err as Error).message}`)
   }
 
-  // The network fixes the address version byte. Prefer the state file, since
-  // that is the deployment being diagnosed; fall back to --network so a proof
-  // can be examined without a wallet on this machine.
-  const wanted = requestedNetwork()
-  let networkName: NetworkName
-  try {
-    const state = loadState(config.statePath)
-    if (wanted !== undefined) assertNetworkMatches(state, wanted)
-    networkName = state.network
-  } catch {
-    if (wanted === undefined) {
-      die('no state file here, so pass --network mainnet or --network testnet')
+  // The callback URL is part of what the verifier is constructed with. Take it
+  // from the flag, or rebuild it from the published host in the state file.
+  let callback = values.callback
+  if (callback === undefined) {
+    try {
+      const state = loadState(config.statePath)
+      const host = config.onion ?? state.onion
+      if (host) callback = `http://${host}/api/auth47/callback`
+    } catch {
+      /* no state here; the flag is then required */
     }
-    networkName = wanted
   }
-  const network = networkFor(networkName)
-
-  const p = proof as Partial<{
-    auth47_response: string
-    challenge: string
-    signature: string
-    nym: string
-    address: string
-  }>
-
-  console.log(`
-  network:  ${networkName}`)
-  const check = (label: string, ok: boolean, detail = ''): boolean => {
-    console.log(`  ${ok ? '✓' : '✗'} ${label}${detail ? `  ${detail}` : ''}`)
-    return ok
+  if (callback === undefined) {
+    die('pass --callback <the storefront callback URL>, e.g. http://yourshop.onion/api/auth47/callback')
   }
 
-  check(
-    'auth47_response is "1.0"',
-    p.auth47_response === AUTH47_RESPONSE_VERSION,
-    p.auth47_response === undefined ? '(missing)' : `(got ${JSON.stringify(p.auth47_response)})`,
-  )
-  if (typeof p.challenge !== 'string' || typeof p.signature !== 'string') {
-    check('challenge and signature are present', false)
+  const p = proof as Partial<{ nym: string; challenge: string; signature: string }>
+  const result = verifyProof(proof, callback)
+
+  console.log('')
+  console.log(`  callback:  ${callback}`)
+  if (typeof p.challenge === 'string') console.log(`  challenge: ${p.challenge}`)
+  if (typeof p.nym === 'string') {
+    console.log(`  nym:       ${p.nym}`)
+    for (const address of notificationAddresses(p.nym)) {
+      console.log(`  may sign from: ${address}`)
+    }
+  }
+  console.log('')
+  if (result.ok) {
+    console.log(`  ✓ valid — controls ${result.paymentCode}`)
     console.log('')
-    process.exit(1)
+    return
   }
-  if (typeof p.nym !== 'string') {
-    check(
-      'nym is a payment code',
-      false,
-      p.address ? '(an address-only proof cannot name a BIP47 counterparty)' : '(missing)',
-    )
-    console.log('')
-    process.exit(1)
-  }
-
-  // Structure, exactly as the storefront checks it.
-  const structural = verifyProof(proof, network)
-  const shapeOk =
-    structural.ok || (structural.error !== 'bad challenge' && structural.error !== 'bad version')
-  check(
-    'challenge is a prepared auth47 URI (c stripped, r present)',
-    shapeOk,
-    shapeOk ? '' : `(${structural.error})`,
-  )
-
-  let expected: string
-  try {
-    expected = notificationAddressOf(p.nym, network)
-  } catch {
-    check('nym decodes as a payment code', false)
-    console.log('')
-    process.exit(1)
-  }
-  check('nym decodes as a payment code', true, `notification address ${expected}`)
-
-  const issued = values.challenge
-  const candidates = proofCandidates(p.challenge, issued)
-  const report = explainSignature(candidates, expected, p.signature, network)
-  check('signature verifies', report.strictOk, report.strictOk ? '' : `(${report.problem})`)
-
-  console.log(`
-  ${report.conclusion}
-`)
-
-  if (!report.strictOk) {
-    console.log('  what was signed, and what we have:')
-    for (const c of candidates) {
-      console.log(`    ${c.label}:`)
-      console.log(`      ${c.message}`)
-    }
-    if (report.headerByte !== undefined) {
-      console.log(`
-  recovery header byte: ${report.headerByte}`)
-    }
-    if (report.recoveredStrict.length > 0) {
-      console.log(`  the signature recovers to: ${report.recoveredStrict.join(', ')}`)
-      console.log(`  it needed to recover to:   ${expected}`)
-    }
-    if (report.matches.length > 0) {
-      console.log('\n  combinations that DO reproduce the expected address:')
-      for (const m of report.matches) {
-        console.log(
-          `    "${m.label}" + ${describeFraming(m.framing)}, ` +
-            `recid ${m.recovery}, ${m.compressed ? 'compressed' : 'uncompressed'}`,
-        )
-      }
-    }
-    if (issued === undefined) {
-      console.log(
-        '\n  Tip: pass --challenge "<the auth47:// URI the storefront issued>" to also test',
-      )
-      console.log('  it against what we actually sent. The service logs it on rejection.')
-    }
-    console.log('')
-    process.exit(1)
-  }
+  console.log(`  ✗ ${result.error}`)
+  console.log('')
+  process.exit(1)
 }
 
 try {
@@ -647,8 +562,8 @@ try {
         '[--network mainnet|testnet] [--label <name>] [--data <dir>]',
     )
     console.error(
-      '       verify-proof [file] [--challenge <issued auth47:// URI>]   ' +
-        'diagnose a rejected wallet proof',
+      '       verify-proof [file] [--callback <storefront callback URL>]   ' +
+        'check a rejected wallet proof',
     )
     process.exit(1)
   }
