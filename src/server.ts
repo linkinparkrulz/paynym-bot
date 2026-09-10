@@ -27,7 +27,10 @@ import type { Network } from './bip47.ts'
 import {
   Auth47Sessions,
   challengeURI,
+  explainSignature,
   newNonce,
+  notificationAddressOf,
+  proofCandidates,
   sameResource,
   verifyProof,
   NONCE_TTL_MS,
@@ -163,6 +166,49 @@ function publicStatus(opts: StorefrontOptions, auth47Available: boolean) {
   }
 }
 
+/**
+ * Explain a rejected signature into the log, once, at the point of failure.
+ *
+ * Payment codes are truncated to 12 characters, matching the daemon's
+ * convention. The addresses are not secret — both are derivable from the
+ * payment code, which is published — and they are the whole point: the address
+ * the signature actually recovers to is what separates "signed with the wrong
+ * key" from "framed the message differently".
+ */
+function logSignatureFailure(proof: unknown, issuedUri: string | undefined, network: Network): void {
+  const p = proof as Partial<{ challenge: string; signature: string; nym: string }>
+  if (typeof p.challenge !== 'string' || typeof p.signature !== 'string' || typeof p.nym !== 'string') {
+    return
+  }
+  let expected: string
+  try {
+    expected = notificationAddressOf(p.nym, network)
+  } catch {
+    return
+  }
+  const report = explainSignature(
+    proofCandidates(p.challenge, issuedUri),
+    expected,
+    p.signature,
+    network,
+  )
+  console.error(
+    `[auth47] rejected a proof from ${p.nym.slice(0, 12)}…: ${report.conclusion}`,
+  )
+  console.error(`[auth47]   expected notification address: ${expected}`)
+  if (report.headerByte !== undefined) {
+    console.error(`[auth47]   recovery header byte: ${report.headerByte}`)
+  }
+  if (report.recoveredStrict.length > 0) {
+    console.error(`[auth47]   signature recovers to: ${report.recoveredStrict.join(', ')}`)
+  }
+  console.error(`[auth47]   posted challenge:  ${p.challenge}`)
+  console.error(`[auth47]   we issued:         ${issuedUri ?? '(unknown — nonce not found)'}`)
+  console.error(
+    '[auth47]   diagnose a captured proof offline with: paynym-bot verify-proof <file>',
+  )
+}
+
 export function createStorefront(opts: StorefrontOptions): Server {
   const index = readFileSync(join(PUBLIC_DIR, 'index.html'))
   const qrScript = readFileSync(join(PUBLIC_DIR, 'js', 'qrcode.js'))
@@ -292,7 +338,7 @@ export function createStorefront(opts: StorefrontOptions): Server {
       // r binds the proof to THIS storefront: a challenge minted elsewhere
       // must not authenticate here, and vice versa.
       const uri = challengeURI(nonce, Math.floor(expires / 1000), callback, origin)
-      if (!sessions.issue(nonce)) {
+      if (!sessions.issue(nonce, uri)) {
         return json(res, 503, { error: 'too many challenges in flight' })
       }
       json(res, 200, { nonce, uri, expires })
@@ -351,7 +397,17 @@ export function createStorefront(opts: StorefrontOptions): Server {
 
       // Structural + cryptographic check.
       const v = verifyProof(proof, networkForAddress(opts.network))
-      if (!v.ok) return json(res, 401, { error: v.error })
+      if (!v.ok) {
+        // "bad signature" is a verdict, not a diagnosis, and the operator is
+        // the one who needs the diagnosis — a real wallet's proof being
+        // rejected is a bug in one of three specific places. Work out which,
+        // and log it. The WIRE response stays the single word: the wallet has
+        // no business being told which internal check failed.
+        if (v.error === 'bad signature') {
+          logSignatureFailure(proof, sessions.issued(nonce), networkForAddress(opts.network))
+        }
+        return json(res, 401, { error: v.error })
+      }
 
       // Consume the nonce: single-use, and only now that the proof is good.
       const rec = sessions.take(nonce)

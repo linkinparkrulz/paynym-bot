@@ -56,6 +56,35 @@ Anything ending in `.onion` is routed through Tor's SOCKS proxy automatically
 > testnet, where there are no real counterparties. Your own Dojo, on loopback or a private
 > network, is always allowed.
 
+### When a wallet's proof is rejected
+
+`"bad signature"` is a verdict, not a diagnosis, and there are only three plausible causes:
+the wallet signed a different serialization of the challenge than it posted, it signed with
+the wrong key, or its message framing disagrees with ours. Those are distinguishable, so
+the receiver distinguishes them. On a rejection it logs which one:
+
+```
+[auth47] rejected a proof from PM8TJUUoFBTJ…: the signature is valid, but not over what
+         was posted: it verifies over "the challenge as posted" using the magic WITHOUT
+         the leading 0x18 control byte, recovery id 0, compressed key
+[auth47]   expected notification address: 1Gwnw69NWZRzPgfDrvmV6WEpd4tt52MgCm
+[auth47]   signature recovers to: 1Nm4CJihAHpxBWH7z6RGsudGqagxseeCKb, …
+[auth47]   posted challenge:  auth47://5b77…?e=…&r=http://…
+[auth47]   we issued:         auth47://5b77…?c=http://…&e=…&r=http://…
+```
+
+The wallet still gets only the single word — it has no business being told which internal
+check failed. To work on a captured payload offline:
+
+```bash
+paynym-bot verify-proof proof.json
+paynym-bot verify-proof proof.json --challenge "auth47://…"   # the URI we issued, from the log
+pbpaste | paynym-bot verify-proof --network mainnet
+```
+
+It re-runs the recovery across every framing, every candidate string and all four recovery
+ids, and reports which combination reproduces the key the payment code names.
+
 ### Scan-to-pay, and the host it is bound to
 
 A customer scans the storefront's QR, their wallet signs it, and the page shows the
@@ -93,6 +122,7 @@ paynym-bot start                    # storefront + listen for customers + scan f
 paynym-bot status                   # network, PayNym, what is being watched
 paynym-bot serve                    # storefront only, no daemon
 paynym-bot doctor                   # find the Dojo services, or explain why not
+paynym-bot verify-proof <file>      # diagnose a wallet proof the storefront rejected
 ```
 
 `init` generates a **12-word BIP39 recovery phrase** and shows it once, or imports one you

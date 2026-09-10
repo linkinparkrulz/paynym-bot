@@ -79,6 +79,261 @@ function messageDigest(message: string): Uint8Array {
   return sha256(sha256(signedMessageBytes(message)))
 }
 
+/** The longest message the single-byte varint length prefix can describe. */
+export const MAX_SIGNED_MESSAGE_BYTES = 252
+
+// --- Diagnostics --------------------------------------------------------------
+//
+// Everything below exists for one reason: "bad signature" is a verdict, not a
+// diagnosis. When a real wallet's proof is rejected there are only a few
+// possible causes, and they are distinguishable — but only if we actually go
+// and look. So on failure we re-run the recovery across every framing a wallet
+// might plausibly have used, every candidate string it might plausibly have
+// signed, and every recovery id, and report which combination (if any)
+// reproduces the key the payment code names. One match names the bug.
+//
+// This is not used to decide whether to accept a proof. `verifyProof` remains
+// strict: the correct framing, over the string the wallet actually posted.
+
+/**
+ * Framings a Bitcoin signed message might have been built with. Only `bitcoin`
+ * is correct; the others are the three ways implementations get it wrong, kept
+ * here so a mismatch can be named instead of guessed at.
+ */
+export type Framing =
+  /** magic 0x18, "Bitcoin Signed Message:\n", varint length, message. */
+  | 'bitcoin'
+  /** The same, with the load-bearing 0x18 control byte omitted. */
+  | 'no-control-byte'
+  /** Magic and message, but no length prefix. */
+  | 'no-length-prefix'
+  /** The message alone, double-hashed with no framing at all. */
+  | 'unframed'
+
+export const FRAMINGS: readonly Framing[] = [
+  'bitcoin',
+  'no-control-byte',
+  'no-length-prefix',
+  'unframed',
+]
+
+/** Human-readable account of what each framing does, for the report. */
+export function describeFraming(framing: Framing): string {
+  switch (framing) {
+    case 'bitcoin':
+      return 'the standard framing (0x18, magic, varint length, message)'
+    case 'no-control-byte':
+      return 'the magic WITHOUT the leading 0x18 control byte'
+    case 'no-length-prefix':
+      return 'the magic with no varint length prefix'
+    case 'unframed':
+      return 'the bare message, with no signed-message framing at all'
+  }
+}
+
+/** Bytes to hash under a given framing, or null when it cannot be expressed. */
+export function framedBytes(message: string, framing: Framing): Uint8Array | null {
+  const msg = textEncoder().encode(message)
+  if (framing === 'unframed') return msg
+  const magic = textEncoder().encode(
+    framing === 'no-control-byte' ? MESSAGE_MAGIC.slice(1) : MESSAGE_MAGIC,
+  )
+  if (framing === 'no-length-prefix') {
+    const out = new Uint8Array(magic.length + msg.length)
+    out.set(magic)
+    out.set(msg, magic.length)
+    return out
+  }
+  if (msg.length > MAX_SIGNED_MESSAGE_BYTES) return null
+  const out = new Uint8Array(magic.length + 1 + msg.length)
+  out.set(magic)
+  out[magic.length] = msg.length
+  out.set(msg, magic.length + 1)
+  return out
+}
+
+/** A candidate string the wallet might have signed, with a label for the report. */
+export type Candidate = { label: string; message: string }
+
+/** One combination that reproduced the expected address. */
+export type SignatureMatch = {
+  label: string
+  framing: Framing
+  recovery: 0 | 1 | 2 | 3
+  compressed: boolean
+}
+
+export type SignatureProblem =
+  | 'not base64'
+  | 'not 65 bytes'
+  | 'header out of range'
+  | 'no match'
+
+export type SignatureReport = {
+  /** True when the strict check — standard framing, posted message — passes. */
+  strictOk: boolean
+  problem?: SignatureProblem
+  signatureBytes?: number
+  headerByte?: number
+  expectedAddress: string
+  /** Every framing/message/recovery combination that reproduced it. */
+  matches: SignatureMatch[]
+  /**
+   * Addresses the signature recovers to under the STRICT framing of the first
+   * candidate, for all four recovery ids. When nothing matches, this is what
+   * the signer's key actually was — which settles whether the wallet signed
+   * with the wrong key or merely framed the message differently.
+   */
+  recoveredStrict: string[]
+  /** One sentence naming the cause, for a log line or the CLI. */
+  conclusion: string
+}
+
+/**
+ * Diagnose a signature: which framing, over which candidate string, with which
+ * recovery id, reproduces `expectedAddress` — if any.
+ *
+ * `candidates[0]` must be the string the wallet actually posted; the strict
+ * check and `recoveredStrict` are both relative to it.
+ */
+export function explainSignature(
+  candidates: readonly Candidate[],
+  expectedAddress: string,
+  signatureBase64: string,
+  network: Network,
+): SignatureReport {
+  const base: Omit<SignatureReport, 'conclusion'> = {
+    strictOk: false,
+    expectedAddress,
+    matches: [],
+    recoveredStrict: [],
+  }
+
+  let compact: Uint8Array
+  try {
+    const raw = Buffer.from(signatureBase64, 'base64')
+    if (raw.length !== 65) {
+      return {
+        ...base,
+        problem: 'not 65 bytes',
+        signatureBytes: raw.length,
+        conclusion:
+          `the signature decoded to ${raw.length} bytes, not 65 — this is not a ` +
+          `recoverable Bitcoin signed-message signature (a DER signature is a common mix-up)`,
+      }
+    }
+    compact = Uint8Array.from(raw)
+  } catch {
+    return { ...base, problem: 'not base64', conclusion: 'the signature is not valid base64' }
+  }
+
+  const headerByte = compact[64]!
+  let sig: ReturnType<typeof secp256k1.Signature.fromCompact>
+  try {
+    sig = secp256k1.Signature.fromCompact(compact.subarray(0, 64))
+  } catch {
+    return {
+      ...base,
+      headerByte,
+      problem: 'not 65 bytes',
+      conclusion: 'the 64 signature bytes are not a valid (r, s) pair on secp256k1',
+    }
+  }
+
+  // Recover under every framing and candidate, ignoring the header byte's
+  // claims: a wrong header is itself one of the things worth catching.
+  const matches: SignatureMatch[] = []
+  const recoveredStrict: string[] = []
+  for (const candidate of candidates) {
+    for (const framing of FRAMINGS) {
+      const bytes = framedBytes(candidate.message, framing)
+      if (bytes === null) continue
+      const digest = sha256(sha256(bytes))
+      for (const recovery of [0, 1, 2, 3] as const) {
+        let pub: ReturnType<typeof sig.recoverPublicKey>
+        try {
+          pub = sig.addRecoveryBit(recovery).recoverPublicKey(digest)
+        } catch {
+          continue // not every recovery id yields a point
+        }
+        for (const compressed of [true, false]) {
+          const address = p2pkhAddress(pub.toRawBytes(compressed), network)
+          if (
+            candidate === candidates[0] &&
+            framing === 'bitcoin' &&
+            compressed &&
+            !recoveredStrict.includes(address)
+          ) {
+            recoveredStrict.push(address)
+          }
+          if (address === expectedAddress) {
+            matches.push({ label: candidate.label, framing, recovery, compressed })
+          }
+        }
+      }
+    }
+  }
+
+  const strictOk = matches.some(
+    (m) =>
+      m.label === candidates[0]?.label &&
+      m.framing === 'bitcoin' &&
+      m.recovery === ((headerByte - 27) & 3) &&
+      m.compressed === headerByte >= 31,
+  )
+
+  if (headerByte < 27 || headerByte > 34) {
+    return {
+      ...base,
+      headerByte,
+      matches,
+      recoveredStrict,
+      problem: 'header out of range',
+      conclusion:
+        `the recovery header byte is ${headerByte}; a Bitcoin signed message uses 27..34 ` +
+        `(27+recid uncompressed, 31+recid compressed)` +
+        (matches.length > 0
+          ? `. The signature IS otherwise valid: ${summarise(matches[0]!)}`
+          : ''),
+    }
+  }
+
+  if (strictOk) {
+    return { ...base, strictOk: true, headerByte, matches, recoveredStrict, conclusion: 'valid' }
+  }
+
+  if (matches.length === 0) {
+    return {
+      ...base,
+      headerByte,
+      matches,
+      recoveredStrict,
+      problem: 'no match',
+      conclusion:
+        `no framing of any candidate string recovers to ${expectedAddress}. The signature ` +
+        `recovers to ${recoveredStrict.join(' or ')} instead, so it was made by a key ` +
+        `other than this payment code's notification key — the wallet signed with the ` +
+        `wrong key, or the nym does not belong to the signer`,
+    }
+  }
+
+  return {
+    ...base,
+    headerByte,
+    matches,
+    recoveredStrict,
+    problem: 'no match',
+    conclusion: `the signature is valid, but not over what was posted: ${summarise(matches[0]!)}`,
+  }
+}
+
+function summarise(m: SignatureMatch): string {
+  return (
+    `it verifies over "${m.label}" using ${describeFraming(m.framing)}, ` +
+    `recovery id ${m.recovery}, ${m.compressed ? 'compressed' : 'uncompressed'} key`
+  )
+}
+
 /**
  * Verify a base64 recoverable Bitcoin signed-message signature against the
  * P2PKH address it claims to come from. Recovery rather than pubkey-verify is
@@ -162,6 +417,59 @@ export function signedForm(uri: string): string | null {
   }
 }
 
+/**
+ * The prepared form as a WHATWG URL serialises it — query values
+ * percent-encoded (`r=http%3A%2F%2F…`). The spec says nothing about encoding,
+ * so a wallet built on a URI builder rather than string concatenation will
+ * arrive at this instead of the decoded form. Kept as a diagnostic candidate:
+ * a signature that verifies over this but was posted as the decoded form is a
+ * serialization mismatch, and that is worth being able to say out loud.
+ */
+export function signedFormEncoded(uri: string): string | null {
+  try {
+    const u = new URL(uri)
+    u.searchParams.delete('c')
+    return u.toString()
+  } catch {
+    return null
+  }
+}
+
+/** The address a payment code's challenge signature must recover to. */
+export function notificationAddressOf(paymentCode: string, network: Network): string {
+  return p2pkhAddress(nodeFromPaymentCode(paymentCode).deriveChild(0).publicKey!, network)
+}
+
+/**
+ * Every string a wallet might plausibly have signed for this proof, with the
+ * POSTED challenge first — the strict check is relative to it.
+ *
+ * `issuedUri`, when known, is the challenge we minted for this nonce. Having
+ * it is what lets the diagnostic distinguish "signed a different serialization
+ * of our challenge" from "signed something we never issued".
+ */
+export function proofCandidates(
+  postedChallenge: string,
+  issuedUri?: string,
+): Candidate[] {
+  const out: Candidate[] = [{ label: 'the challenge as posted', message: postedChallenge }]
+  const push = (label: string, message: string | null): void => {
+    if (message !== null && !out.some((c) => c.message === message)) out.push({ label, message })
+  }
+  // Re-serialise the POSTED challenge both ways. This catches the mismatch
+  // even when the issued URI is unknown — a wallet that signs one
+  // serialization and posts the other has posted enough for us to reconstruct
+  // the form it signed, since only the encoding differs.
+  push('the posted challenge, re-encoded (percent-encoded query)', signedFormEncoded(postedChallenge))
+  push('the posted challenge with c stripped', signedForm(postedChallenge))
+  if (issuedUri !== undefined) {
+    push('our issued challenge, prepared and percent-decoded', signedForm(issuedUri))
+    push('our issued challenge, prepared and percent-encoded', signedFormEncoded(issuedUri))
+    push('our issued challenge verbatim, c and all', issuedUri)
+  }
+  return out
+}
+
 /** Nonces are the "host" of the auth47 URI: alphanumeric. */
 export function newNonce(): string {
   return randomBytes(16).toString('hex')
@@ -183,6 +491,7 @@ export type VerifyError =
   | 'bad challenge'
   | 'bad payment code'
   | 'bad signature'
+  | 'challenge too long'
   | 'expired'
 
 export type VerifyResult =
@@ -238,6 +547,13 @@ export function verifyProof(
     const when = Number(e)
     if (!Number.isInteger(when) || when * 1000 <= now) return { ok: false, error: 'expired' }
   }
+  // Its own error, not "bad signature". signedMessageBytes throws past the
+  // single-byte varint, and that throw used to be swallowed by
+  // verifySignedMessage's catch — reporting a length problem as a crypto one,
+  // which is the sort of thing that costs an afternoon.
+  if (textEncoder().encode(p.challenge).length > MAX_SIGNED_MESSAGE_BYTES) {
+    return { ok: false, error: 'challenge too long' }
+  }
 
   // The nym must decode; nodeFromPaymentCode throws on any malformed code.
   let notificationAddress: string
@@ -265,7 +581,21 @@ export function sameResource(a: string, b: string): boolean {
 
 // --- Nonce and session stores ------------------------------------------------
 
-type NonceRecord = { expires: number; used: boolean; sessionId?: string }
+type NonceRecord = {
+  expires: number
+  used: boolean
+  sessionId?: string
+  /**
+   * The challenge URI we minted for this nonce.
+   *
+   * Kept so a rejected proof can be compared against what we actually issued,
+   * rather than only against what the wallet echoed back. It does not change
+   * what is accepted — `verifyProof` still checks the posted string — but it
+   * is the difference between "bad signature" and "the wallet signed the
+   * percent-encoded form of our challenge and posted the decoded one".
+   */
+  uri: string
+}
 
 /**
  * In-memory challenge and session state. Single-process by design: this bot is
@@ -293,11 +623,20 @@ export class Auth47Sessions {
    * already at MAX_LIVE_NONCES, so the caller can refuse rather than grow: the
    * endpoint that calls this is unauthenticated.
    */
-  issue(nonce: string, ttlMs = NONCE_TTL_MS): boolean {
+  issue(nonce: string, uri: string, ttlMs = NONCE_TTL_MS): boolean {
     this.gc()
     if (this.nonces.size >= MAX_LIVE_NONCES) return false
-    this.nonces.set(nonce, { expires: this.now() + ttlMs, used: false })
+    this.nonces.set(nonce, { expires: this.now() + ttlMs, used: false, uri })
     return true
+  }
+
+  /**
+   * The challenge URI issued for a nonce, live or already consumed. For
+   * diagnostics only — a consumed record still holds it, which is exactly when
+   * it is wanted.
+   */
+  issued(nonce: string): string | undefined {
+    return this.nonces.get(nonce)?.uri
   }
 
   /**

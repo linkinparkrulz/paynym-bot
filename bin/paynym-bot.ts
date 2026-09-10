@@ -42,6 +42,14 @@ import {
 import { assertIndexerAllowed, isOnion, loadConfig, proxyFor } from '../src/config.ts'
 import { createStorefront } from '../src/server.ts'
 import {
+  AUTH47_RESPONSE_VERSION,
+  describeFraming,
+  explainSignature,
+  notificationAddressOf,
+  proofCandidates,
+  verifyProof,
+} from '../src/auth47.ts'
+import {
   assertNetworkMatches,
   isNetworkName,
   loadState,
@@ -60,6 +68,7 @@ const { values, positionals } = parseArgs({
     mnemonic: { type: 'string' },
     passphrase: { type: 'string' },
     force: { type: 'boolean', default: false },
+    challenge: { type: 'string' },
   },
 })
 
@@ -467,16 +476,179 @@ async function doctor(): Promise<void> {
   if (!ok) process.exit(1)
 }
 
+/**
+ * Diagnose a captured Auth47 proof offline.
+ *
+ * "bad signature" has exactly three plausible causes — the wallet signed a
+ * different serialization of the challenge than it posted, it signed with the
+ * wrong key, or its message framing disagrees with ours — and they are
+ * distinguishable if you actually look. This looks: it re-runs the recovery
+ * across every framing, every candidate string and all four recovery ids, and
+ * says which combination (if any) reproduces the key the payment code names.
+ *
+ * Usage:
+ *   paynym-bot verify-proof proof.json
+ *   pbpaste | paynym-bot verify-proof
+ *
+ * The proof is the JSON body the wallet POSTs to the callback:
+ *   { "auth47_response": "1.0", "challenge": "auth47://…", "signature": "…", "nym": "PM8T…" }
+ *
+ * Pass --challenge to supply the URI the storefront issued, when you have it
+ * from the log: knowing what we sent is what separates "signed a different
+ * serialization of OUR challenge" from "signed something we never issued".
+ */
+async function verifyProofCommand(): Promise<void> {
+  const source = positionals[1]
+  const raw = source
+    ? readFileSync(source, 'utf8')
+    : await new Promise<string>((resolve, reject) => {
+        let buf = ''
+        process.stdin.setEncoding('utf8')
+        process.stdin.on('data', (chunk) => (buf += chunk))
+        process.stdin.on('end', () => resolve(buf))
+        process.stdin.on('error', reject)
+      })
+  if (raw.trim().length === 0) {
+    die('no proof given: pass a file, or pipe the JSON payload on stdin')
+  }
+
+  let proof: unknown
+  try {
+    proof = JSON.parse(raw)
+  } catch (err) {
+    die(`that is not valid JSON: ${(err as Error).message}`)
+  }
+
+  // The network fixes the address version byte. Prefer the state file, since
+  // that is the deployment being diagnosed; fall back to --network so a proof
+  // can be examined without a wallet on this machine.
+  const wanted = requestedNetwork()
+  let networkName: NetworkName
+  try {
+    const state = loadState(config.statePath)
+    if (wanted !== undefined) assertNetworkMatches(state, wanted)
+    networkName = state.network
+  } catch {
+    if (wanted === undefined) {
+      die('no state file here, so pass --network mainnet or --network testnet')
+    }
+    networkName = wanted
+  }
+  const network = networkFor(networkName)
+
+  const p = proof as Partial<{
+    auth47_response: string
+    challenge: string
+    signature: string
+    nym: string
+    address: string
+  }>
+
+  console.log(`
+  network:  ${networkName}`)
+  const check = (label: string, ok: boolean, detail = ''): boolean => {
+    console.log(`  ${ok ? '✓' : '✗'} ${label}${detail ? `  ${detail}` : ''}`)
+    return ok
+  }
+
+  check(
+    'auth47_response is "1.0"',
+    p.auth47_response === AUTH47_RESPONSE_VERSION,
+    p.auth47_response === undefined ? '(missing)' : `(got ${JSON.stringify(p.auth47_response)})`,
+  )
+  if (typeof p.challenge !== 'string' || typeof p.signature !== 'string') {
+    check('challenge and signature are present', false)
+    console.log('')
+    process.exit(1)
+  }
+  if (typeof p.nym !== 'string') {
+    check(
+      'nym is a payment code',
+      false,
+      p.address ? '(an address-only proof cannot name a BIP47 counterparty)' : '(missing)',
+    )
+    console.log('')
+    process.exit(1)
+  }
+
+  // Structure, exactly as the storefront checks it.
+  const structural = verifyProof(proof, network)
+  const shapeOk =
+    structural.ok || (structural.error !== 'bad challenge' && structural.error !== 'bad version')
+  check(
+    'challenge is a prepared auth47 URI (c stripped, r present)',
+    shapeOk,
+    shapeOk ? '' : `(${structural.error})`,
+  )
+
+  let expected: string
+  try {
+    expected = notificationAddressOf(p.nym, network)
+  } catch {
+    check('nym decodes as a payment code', false)
+    console.log('')
+    process.exit(1)
+  }
+  check('nym decodes as a payment code', true, `notification address ${expected}`)
+
+  const issued = values.challenge
+  const candidates = proofCandidates(p.challenge, issued)
+  const report = explainSignature(candidates, expected, p.signature, network)
+  check('signature verifies', report.strictOk, report.strictOk ? '' : `(${report.problem})`)
+
+  console.log(`
+  ${report.conclusion}
+`)
+
+  if (!report.strictOk) {
+    console.log('  what was signed, and what we have:')
+    for (const c of candidates) {
+      console.log(`    ${c.label}:`)
+      console.log(`      ${c.message}`)
+    }
+    if (report.headerByte !== undefined) {
+      console.log(`
+  recovery header byte: ${report.headerByte}`)
+    }
+    if (report.recoveredStrict.length > 0) {
+      console.log(`  the signature recovers to: ${report.recoveredStrict.join(', ')}`)
+      console.log(`  it needed to recover to:   ${expected}`)
+    }
+    if (report.matches.length > 0) {
+      console.log('\n  combinations that DO reproduce the expected address:')
+      for (const m of report.matches) {
+        console.log(
+          `    "${m.label}" + ${describeFraming(m.framing)}, ` +
+            `recid ${m.recovery}, ${m.compressed ? 'compressed' : 'uncompressed'}`,
+        )
+      }
+    }
+    if (issued === undefined) {
+      console.log(
+        '\n  Tip: pass --challenge "<the auth47:// URI the storefront issued>" to also test',
+      )
+      console.log('  it against what we actually sent. The service logs it on rejection.')
+    }
+    console.log('')
+    process.exit(1)
+  }
+}
+
 try {
   if (command === 'init') await init()
   else if (command === 'status') status()
   else if (command === 'serve') serve()
   else if (command === 'start') start()
   else if (command === 'doctor') await doctor()
+  else if (command === 'verify-proof') await verifyProofCommand()
   else {
     console.error(
-      'usage: paynym-bot <init|status|serve|start|doctor> ' +
+      'usage: paynym-bot <init|status|serve|start|doctor|verify-proof> ' +
         '[--network mainnet|testnet] [--label <name>] [--data <dir>]',
+    )
+    console.error(
+      '       verify-proof [file] [--challenge <issued auth47:// URI>]   ' +
+        'diagnose a rejected wallet proof',
     )
     process.exit(1)
   }

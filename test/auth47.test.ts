@@ -18,7 +18,13 @@ import {
   newNonce,
   NONCE_TTL_MS,
   MAX_LIVE_NONCES,
+  explainSignature,
+  framedBytes,
+  notificationAddressOf,
+  proofCandidates,
+  signedFormEncoded,
 } from '../src/auth47.ts'
+import type { Framing } from '../src/auth47.ts'
 import { secp256k1 } from '@noble/curves/secp256k1'
 import { sha256 } from '@noble/hashes/sha256'
 
@@ -163,9 +169,13 @@ assert('different origin does not match', !sameResource('http://evil.onion', ori
 
 // --- nonce / session store -------------------------------------------------------
 
+// The store keeps the issued URI for diagnostics; these cases only exercise
+// nonce lifecycle, so any well-formed challenge stands in for it.
+const forNonce = (n: string) => challengeURI(n, expires, callback, origin)
+
 const sessions = new Auth47Sessions()
 const n1 = newNonce()
-sessions.issue(n1)
+sessions.issue(n1, forNonce(n1))
 assert('issued nonce can be taken once', sessions.take(n1) !== null)
 assert('nonce is single-use', sessions.take(n1) === null)
 
@@ -173,7 +183,7 @@ const n2 = newNonce()
 assert('unknown nonce is rejected', sessions.take(n2) === null)
 
 const n3 = newNonce()
-sessions.issue(n3)
+sessions.issue(n3, forNonce(n3))
 const rec = sessions.take(n3)!
 const sid = sessions.mint(alice.paymentCode())
 sessions.claim(n3, sid)
@@ -189,7 +199,7 @@ assert('dropped session is gone', sessions.session(sid) === null)
 let fakeNow = Date.now()
 const clockSessions = new Auth47Sessions(() => fakeNow)
 const n4 = newNonce()
-clockSessions.issue(n4)
+clockSessions.issue(n4, forNonce(n4))
 fakeNow += NONCE_TTL_MS + 1
 assert('nonce expires with its TTL', clockSessions.take(n4) === null)
 
@@ -204,9 +214,16 @@ assert('session expires with its TTL', clockSessions.session(sid5) === null)
 {
   const bounded = new Auth47Sessions()
   let issued = 0
-  for (let i = 0; i < MAX_LIVE_NONCES + 50; i++) if (bounded.issue(newNonce())) issued++
+  for (let i = 0; i < MAX_LIVE_NONCES + 50; i++) {
+    const n = newNonce()
+    if (bounded.issue(n, forNonce(n))) issued++
+  }
   assert('issue stops at the cap', issued === MAX_LIVE_NONCES)
-  assert('and says so, rather than growing quietly', bounded.issue(newNonce()) === false)
+  const overflow = newNonce()
+  assert(
+    'and says so, rather than growing quietly',
+    bounded.issue(overflow, forNonce(overflow)) === false,
+  )
 }
 
 // --- peek is the cheap gate, and does not consume ------------------------------
@@ -217,7 +234,7 @@ assert('session expires with its TTL', clockSessions.session(sid5) === null)
 {
   const gate = new Auth47Sessions()
   const n = newNonce()
-  gate.issue(n)
+  gate.issue(n, forNonce(n))
   assert('peek sees a live nonce', gate.peek(n))
   assert('peek does not consume it', gate.peek(n) && gate.take(n) !== null)
   assert('peek is false once consumed', !gate.peek(n))
@@ -231,7 +248,7 @@ assert('session expires with its TTL', clockSessions.session(sid5) === null)
 {
   const st = new Auth47Sessions()
   const n = newNonce()
-  st.issue(n)
+  st.issue(n, forNonce(n))
   st.take(n)
   const sessionId = st.mint(alice.paymentCode())
   st.claim(n, sessionId)
@@ -245,12 +262,136 @@ assert('session expires with its TTL', clockSessions.session(sid5) === null)
 {
   const once = new Auth47Sessions()
   const n = newNonce()
-  once.issue(n)
+  once.issue(n, forNonce(n))
   once.take(n)
   const sessionId = once.mint(alice.paymentCode())
   once.claim(n, sessionId)
   assert('the first claim wins', once.claimed(n) === sessionId)
   assert('a second claim gets nothing', once.claimed(n) === null)
+}
+
+// --- the diagnostic names the cause -------------------------------------------
+//
+// "bad signature" is a verdict, not a diagnosis, and there are exactly three
+// plausible causes when a real wallet's proof is rejected. These pin that each
+// one is NAMED rather than collapsed into the same word — which is the whole
+// reason this machinery exists, after the same bug was declared fixed once on
+// a guess.
+
+/** Sign under a chosen framing and header offset, as a misbehaving wallet would. */
+function signAs(
+  identity: PaynymIdentity,
+  message: string,
+  framing: Framing = 'bitcoin',
+  headerOffset = 31,
+): string {
+  const digest = sha256(sha256(framedBytes(message, framing)!))
+  const sig = secp256k1.sign(digest, identity.identityPrivateKey())
+  const out = new Uint8Array(65)
+  out.set(sig.toBytes())
+  out[64] = sig.recovery + headerOffset
+  return Buffer.from(out).toString('base64')
+}
+
+const expectedAddress = notificationAddressOf(alice.paymentCode(), network)
+
+// (c) framing: the 0x18 control byte omitted — the bug 8eef733 claimed to fix.
+{
+  const report = explainSignature(
+    proofCandidates(prepared),
+    expectedAddress,
+    signAs(alice, prepared, 'no-control-byte'),
+    network,
+  )
+  assert('framing mismatch is not accepted', !report.strictOk)
+  assert(
+    'framing mismatch is NAMED as the missing control byte',
+    report.matches.some((m) => m.framing === 'no-control-byte'),
+  )
+  assert('and the conclusion says so in words', /0x18/.test(report.conclusion))
+}
+
+// (b) wrong key: a valid signature by someone else over the right challenge.
+{
+  const report = explainSignature(
+    proofCandidates(prepared),
+    expectedAddress,
+    signAs(bob, prepared),
+    network,
+  )
+  assert('a signature by another key is not accepted', !report.strictOk)
+  assert('nothing in the matrix reproduces the nym', report.matches.length === 0)
+  assert(
+    'the report says which key it WAS',
+    report.recoveredStrict.length > 0 && !report.recoveredStrict.includes(expectedAddress),
+  )
+  assert('and calls it a key problem', /wrong key|other than/.test(report.conclusion))
+}
+
+// (a) serialization: signs the percent-encoded form, posts the decoded one.
+// Caught without knowing the issued URI, by re-serialising what was posted.
+{
+  const encoded = signedFormEncoded(fullUri)!
+  const report = explainSignature(
+    proofCandidates(prepared),
+    expectedAddress,
+    signAs(alice, encoded),
+    network,
+  )
+  assert('a serialization mismatch is not accepted', !report.strictOk)
+  assert(
+    'the serialization mismatch is NAMED, with no issued URI needed',
+    report.matches.some((m) => /re-encoded/.test(m.label) && m.framing === 'bitcoin'),
+  )
+}
+
+// A valid proof still reports valid, so the diagnostic agrees with the verifier.
+{
+  const report = explainSignature(
+    proofCandidates(prepared),
+    expectedAddress,
+    proof.signature,
+    network,
+  )
+  assert('a good signature is reported valid', report.strictOk && report.conclusion === 'valid')
+}
+
+// Shape problems get their own answers rather than a crypto verdict.
+{
+  const der = Buffer.from(
+    secp256k1.sign(sha256(sha256(signedMessageBytes(prepared))), alice.identityPrivateKey()).toDERRawBytes(),
+  ).toString('base64')
+  const report = explainSignature(proofCandidates(prepared), expectedAddress, der, network)
+  assert('a DER signature is called out by length', report.problem === 'not 65 bytes')
+  assert('and named as the likely mix-up', /DER/.test(report.conclusion))
+
+  const badHeader = explainSignature(
+    proofCandidates(prepared),
+    expectedAddress,
+    signAs(alice, prepared, 'bitcoin', 99),
+    network,
+  )
+  assert('an out-of-range header byte is called out', badHeader.problem === 'header out of range')
+  assert(
+    'and the report notes the signature was otherwise fine',
+    /otherwise valid/.test(badHeader.conclusion),
+  )
+}
+
+// The varint ceiling is its own error, not "bad signature": the throw inside
+// signedMessageBytes used to be swallowed and reported as a crypto failure.
+{
+  const longResource = `http://${'x'.repeat(240)}.onion`
+  const longUri = signedForm(challengeURI(newNonce(), expires, callback, longResource))!
+  assert('an over-long challenge is over the varint ceiling', longUri.length > 252)
+  const v = verifyProof(
+    { auth47_response: '1.0', challenge: longUri, signature: proof.signature, nym: alice.paymentCode() },
+    network,
+  )
+  assert(
+    'and it reports its own error, not "bad signature"',
+    !v.ok && v.error === 'challenge too long',
+  )
 }
 
 console.log('')
