@@ -6,7 +6,7 @@
 // These tests pin that: the choice takes effect, and a mismatch is refused
 // loudly rather than silently presenting another PayNym.
 
-import { mkdtempSync, existsSync, statSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, existsSync, statSync, rmSync, writeFileSync, chmodSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { PaynymIdentity } from '../src/identity.ts'
@@ -138,6 +138,26 @@ assert(
   const empty = join(dir, 'empty-state.json')
   writeFileSync(empty, JSON.stringify({ ...newState('mainnet'), onion: '' }))
   assert('an empty onion is treated as unset', loadState(empty).onion === undefined)
+}
+
+// --- an unreadable state file says what to do about it ----------------------
+// The file is 0600 and owned by the service account, and the CLI is on the
+// operator's PATH, so "exists but unreadable" is routine. An EACCES stack is a
+// poor way to learn that sudo was needed. Skipped as root, which can read it.
+if (process.getuid?.() !== 0) {
+  const locked = join(dir, 'locked-state.json')
+  saveState(locked, newState('mainnet'))
+  chmodSync(locked, 0o000)
+  let message = ''
+  try {
+    loadState(locked)
+  } catch (err) {
+    message = (err as Error).message
+  }
+  chmodSync(locked, 0o600) // so the cleanup below can remove it
+  assert('an unreadable state file is not reported as missing', !/no state at/.test(message))
+  assert('the error names sudo as the fix', /sudo/.test(message))
+  assert('and names --data as the alternative', /--data/.test(message))
 }
 
 rmSync(dir, { recursive: true, force: true })

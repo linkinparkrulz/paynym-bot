@@ -15,6 +15,7 @@
 import { execFileSync } from 'node:child_process'
 import { existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { removeBlock } from '../src/torrc.ts'
+import { SHIM_PATH, isOurShim } from '../src/shim.ts'
 
 const args = new Set(process.argv.slice(2))
 const APPLY = args.has('--apply')
@@ -65,6 +66,19 @@ if (existsSync(UNIT)) {
   })
 } else {
   info(`${UNIT} is not present`)
+}
+
+// The command wrapper. Only ours to delete: /usr/local/bin belongs to the
+// operator, and something else called paynym-bot has a history we know nothing
+// about.
+if (existsSync(SHIM_PATH)) {
+  if (isOurShim(readFileSync(SHIM_PATH, 'utf8'))) {
+    act(`remove the paynym-bot command at ${SHIM_PATH}`, () => rmSync(SHIM_PATH, { force: true }))
+  } else {
+    warn(`${SHIM_PATH} was not written by us — leaving it alone`)
+  }
+} else {
+  info(`${SHIM_PATH} is not present`)
 }
 
 // --- torrc ------------------------------------------------------------------

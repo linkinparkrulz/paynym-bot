@@ -125,6 +125,24 @@ paynym-bot doctor                   # find the Dojo services, or explain why not
 paynym-bot verify-proof <file>      # diagnose a wallet proof the storefront rejected
 ```
 
+`./install.sh` puts that command at `/usr/local/bin/paynym-bot`, pinned to the same Node
+the service runs on and defaulted to the installed data directory. If something else is
+already sitting at that path, the installer says so and leaves it alone rather than
+overwriting it.
+
+**Without installing**, run it straight from a checkout — which is what you want when
+diagnosing a captured proof on a machine that is not the server:
+
+```bash
+./bin/paynym-bot.ts verify-proof proof.json --network mainnet
+# or, if your shell dislikes the `env -S` shebang:
+node --experimental-strip-types --no-warnings bin/paynym-bot.ts verify-proof proof.json --network mainnet
+```
+
+Commands that read the wallet need the data directory, which is `0600` and owned by the
+service account — so `status`, `serve` and `start` want `sudo`, or `--data <dir>` pointing
+somewhere you own. `verify-proof` with an explicit `--network` reads nothing.
+
 `init` generates a **12-word BIP39 recovery phrase** and shows it once, or imports one you
 already have (`--mnemonic "…"`), so the bot can run on a PayNym you already own.
 

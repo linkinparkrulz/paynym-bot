@@ -89,7 +89,23 @@ export function parseState(raw: string): PersistedState {
 
 export function loadState(path: string): PersistedState {
   if (!existsSync(path)) throw new Error(`no state at ${path} — run "paynym-bot init" first`)
-  return parseState(readFileSync(path, 'utf8'))
+  let raw: string
+  try {
+    raw = readFileSync(path, 'utf8')
+  } catch (err) {
+    // The state file is 0600 and owned by the service user, and the CLI is now
+    // on every operator's PATH — so "exists but unreadable" is a routine thing
+    // to hit, and an EACCES stack is a poor way to learn that sudo was needed.
+    if ((err as NodeJS.ErrnoException).code === 'EACCES') {
+      throw new Error(
+        `${path} exists but this user cannot read it. It holds the recovery phrase's ` +
+          `other half, so it is owned by the service account and kept 0600. Run the ` +
+          `command with sudo, or point at a data directory you own with --data <dir>.`,
+      )
+    }
+    throw err
+  }
+  return parseState(raw)
 }
 
 /**

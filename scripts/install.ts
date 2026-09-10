@@ -7,11 +7,12 @@
 import { execFileSync } from 'node:child_process'
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { createInterface } from 'node:readline/promises'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { PaynymIdentity } from '../src/identity.ts'
 import { loadState, networkFor, newState, saveState } from '../src/state.ts'
 import { isValidMnemonic, newMnemonic, normaliseMnemonic, seedFromMnemonic } from '../src/seed.ts'
 import { mergeTorrc } from '../src/torrc.ts'
+import { SHIM_PATH, isOurShim, shimScript } from '../src/shim.ts'
 import {
   FULCRUM_PORT,
   SOROBAN_PORT,
@@ -422,10 +423,13 @@ try {
 
   // --- 8. Service -----------------------------------------------------------
   heading('Service')
+  // `nodeBin` is the one validated by nodeIsReachableByService above, and it is
+  // reused for the CLI wrapper below: a command that diagnosed a deployment
+  // running on a different runtime would be worse than no command at all.
   const unit = readFileSync(join(REPO, 'scripts', 'paynym-bot.service'), 'utf8')
     .replaceAll('__SERVICE_USER__', SERVICE_USER)
     .replaceAll('__INSTALL_ROOT__', root)
-    .replaceAll('__NODE_BIN__', flag('node-bin') ?? process.execPath)
+    .replaceAll('__NODE_BIN__', nodeBin)
     .replaceAll('__DATA_DIR__', dataDir)
     .replaceAll('__SOROBAN_URL__', sorobanUrl)
     .replaceAll('__ELECTRUM_HOST__', indexer.host)
@@ -437,6 +441,20 @@ try {
     )
 
   act(`write ${UNIT}`, () => writeFileSync(UNIT, unit, { mode: 0o644 }))
+
+  // The command itself. Without this, `paynym-bot doctor` — which this
+  // installer prints on its own final screen — is not a command that exists.
+  const shimBlocked =
+    existsSync(SHIM_PATH) && !isOurShim(readFileSync(SHIM_PATH, 'utf8'))
+  if (shimBlocked) {
+    warn(`${SHIM_PATH} already exists and was not written by us — leaving it alone`)
+    warn(`run the CLI as: ${nodeBin} --experimental-strip-types ${root}/bin/paynym-bot.ts <command>`)
+  } else {
+    act(`install the paynym-bot command at ${SHIM_PATH}`, () => {
+      mkdirSync(dirname(SHIM_PATH), { recursive: true })
+      writeFileSync(SHIM_PATH, shimScript({ nodeBin, root, dataDir }), { mode: 0o755 })
+    })
+  }
   act('enable and start paynym-bot', () => {
     sh('systemctl', ['daemon-reload'])
     sh('systemctl', ['enable', '--now', 'paynym-bot.service'])
