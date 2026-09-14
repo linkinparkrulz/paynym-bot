@@ -1,0 +1,149 @@
+// Durable daemon state.
+//
+// This file is the other half of the backup, alongside the seed. Receive keys
+// CANNOT be re-derived from the seed alone: a BIP47 address is a function of
+// BOTH parties' payment codes, so the registered customer codes kept here are
+// required to find money that has already arrived. Losing this file does not
+// lose funds outright, but it makes them undiscoverable until every customer
+// registers again.
+//
+// The network is recorded here and is immutable for the life of the state. It
+// fixes the BIP47 derivation path (m/47'/0' vs m/47'/1') and therefore the
+// merchant's own payment code, so running against a different network would
+// silently present a different PayNym and orphan every registered customer.
+
+import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { dirname } from 'node:path'
+import { MAINNET, TESTNET } from './bip47.ts'
+import type { Network } from './bip47.ts'
+import type { SenderRecord } from './register.ts'
+
+export const STATE_VERSION = 1
+
+export type NetworkName = 'mainnet' | 'testnet'
+
+const NETWORKS: Record<NetworkName, Network> = { mainnet: MAINNET, testnet: TESTNET }
+
+export function isNetworkName(value: unknown): value is NetworkName {
+  return value === 'mainnet' || value === 'testnet'
+}
+
+/** The Network parameters for a stored network name. */
+export function networkFor(name: NetworkName): Network {
+  return NETWORKS[name]
+}
+
+export type PersistedState = {
+  version: number
+  /** Chosen at init and never changed. See the note at the top of this file. */
+  network: NetworkName
+  createdAt: number
+  /** Optional shop name shown on the storefront above the payment code. */
+  label?: string
+  /**
+   * The host this storefront is published as — the .onion Tor generated for
+   * it, recorded by the installer once Tor has written the hostname file.
+   *
+   * This is a security parameter, not a convenience: the Auth47 flow binds
+   * every proof to this host, and it must come from the operator rather than
+   * from a request's own Host header. See StorefrontOptions.onionHost.
+   */
+  onion?: string
+  /**
+   * What the paynym.rs directory knows about our code, from the init-time
+   * registration (see paynymrs.ts). Informational only — the avatar and
+   * nymName resolve from the code itself — but kept so `status` can say what
+   * the directory shows, and so re-registration can be skipped when the
+   * claim already took.
+   */
+  paynym?: { nymName?: string; nymId?: string; claimed: boolean; at: number }
+  /** Customers who have registered with us. Required to derive receive keys. */
+  senders: SenderRecord[]
+}
+
+export function newState(
+  network: NetworkName,
+  now = Date.now(),
+  label?: string,
+): PersistedState {
+  return { version: STATE_VERSION, network, createdAt: now, label, senders: [] }
+}
+
+/** Parse and validate raw state JSON. Throws with an actionable message. */
+export function parseState(raw: string): PersistedState {
+  let value: unknown
+  try {
+    value = JSON.parse(raw)
+  } catch {
+    throw new Error('state file is not valid JSON; restore it from your backup')
+  }
+  const s = value as Partial<PersistedState>
+  if (s.version !== STATE_VERSION) {
+    throw new Error(`unsupported state version ${String(s.version)} (expected ${STATE_VERSION})`)
+  }
+  if (!isNetworkName(s.network)) {
+    throw new Error(`state file has an invalid network: ${String(s.network)}`)
+  }
+  if (!Array.isArray(s.senders)) throw new Error('state file has no senders array')
+  return {
+    version: STATE_VERSION,
+    network: s.network,
+    createdAt: typeof s.createdAt === 'number' ? s.createdAt : 0,
+    label: typeof s.label === 'string' ? s.label : undefined,
+    onion: typeof s.onion === 'string' && s.onion.length > 0 ? s.onion : undefined,
+    paynym:
+      s.paynym !== null && typeof s.paynym === 'object' && typeof (s.paynym as { at?: unknown }).at === 'number'
+        ? (s.paynym as PersistedState['paynym'])
+        : undefined,
+    senders: s.senders as SenderRecord[],
+  }
+}
+
+export function loadState(path: string): PersistedState {
+  if (!existsSync(path)) throw new Error(`no state at ${path} — run "paynym-bot init" first`)
+  let raw: string
+  try {
+    raw = readFileSync(path, 'utf8')
+  } catch (err) {
+    // The state file is 0600 and owned by the service user, and the CLI is now
+    // on every operator's PATH — so "exists but unreadable" is a routine thing
+    // to hit, and an EACCES stack is a poor way to learn that sudo was needed.
+    if ((err as NodeJS.ErrnoException).code === 'EACCES') {
+      throw new Error(
+        `${path} exists but this user cannot read it. It holds the recovery phrase's ` +
+          `other half, so it is owned by the service account and kept 0600. Run the ` +
+          `command with sudo, or point at a data directory you own with --data <dir>.`,
+      )
+    }
+    throw err
+  }
+  return parseState(raw)
+}
+
+/**
+ * Write state atomically: a full write to a temp file in the same directory,
+ * then a rename. A crash mid-write can therefore never leave a truncated state
+ * file, which would take the customer payment codes with it.
+ */
+export function saveState(path: string, state: PersistedState): void {
+  mkdirSync(dirname(path), { recursive: true })
+  const tmp = `${path}.tmp`
+  writeFileSync(tmp, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 })
+  renameSync(tmp, path)
+  chmodSync(path, 0o600)
+}
+
+/**
+ * Refuse to run against a network other than the one this state was created
+ * with. Loud failure beats silently presenting a different PayNym.
+ */
+export function assertNetworkMatches(state: PersistedState, configured: NetworkName): void {
+  if (state.network !== configured) {
+    throw new Error(
+      `network mismatch: this state was created for ${state.network}, but ${configured} was ` +
+        `requested. The network fixes the BIP47 derivation path and therefore the PayNym ` +
+        `itself, so it cannot be changed. Use --network ${state.network}, or run init in a ` +
+        `separate data directory to operate on ${configured}.`,
+    )
+  }
+}

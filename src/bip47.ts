@@ -16,7 +16,7 @@ import { secp256k1 } from '@noble/curves/secp256k1'
 import { sha256 } from '@noble/hashes/sha256'
 import { ripemd160 } from '@noble/hashes/ripemd160'
 import { HDKey } from '@scure/bip32'
-import { base58check as base58checkFactory } from '@scure/base'
+import { base58check as base58checkFactory, bech32 } from '@scure/base'
 
 const base58check = base58checkFactory(sha256)
 const Point = secp256k1.ProjectivePoint
@@ -25,17 +25,28 @@ const CURVE_N = secp256k1.CURVE.n
 export type Network = {
   // P2PKH version byte: 0x00 mainnet, 0x6f testnet.
   p2pkhVersion: number
-  // BIP32 xpub version: 0x0488b21e mainnet, 0x043587cf testnet.
-  xpubVersion: number
   // SLIP-44 coin type for the m/47'/coin'/account' path (0 mainnet, 1 testnet).
   coinType: number
+  // Bech32 HRP for P2WPKH: 'bc' mainnet, 'tb' testnet.
+  bech32Hrp: string
 }
 
-export const MAINNET: Network = { p2pkhVersion: 0x00, xpubVersion: 0x0488b21e, coinType: 0 }
-export const TESTNET: Network = { p2pkhVersion: 0x6f, xpubVersion: 0x043587cf, coinType: 1 }
+export const MAINNET: Network = { p2pkhVersion: 0x00, coinType: 0, bech32Hrp: 'bc' }
+export const TESTNET: Network = { p2pkhVersion: 0x6f, coinType: 1, bech32Hrp: 'tb' }
+
+export type AddressType = 'p2pkh' | 'p2wpkh'
 
 const PAYMENT_CODE_VERSION = 0x01
 const PAYMENT_CODE_PREFIX = 0x47 // makes the base58 string start with "PM8T..."
+
+/**
+ * Byte 79 of the payment code body: the Samourai segwit feature flag. Set to
+ * 1 it tells senders this code's owner can receive P2WPKH, and segwit-capable
+ * wallets (Samourai/Ashigaru, @dojo-tools/bip47) derive bech32 payment
+ * addresses for it. The derivation keys are unchanged — only the address
+ * encoding and this advertised flag differ.
+ */
+export const SEGWIT_FEATURE_BYTE = 79
 
 function toHex(u8: Uint8Array): string {
   return Buffer.from(u8).toString('hex')
@@ -61,10 +72,35 @@ export function p2pkhAddress(pubkey: Uint8Array, network: Network = MAINNET): st
   return base58check.encode(payload)
 }
 
-export type PaymentCodeParts = { pubkey: Uint8Array; chainCode: Uint8Array }
+/** Encode a compressed pubkey as a bech32 P2WPKH address (BIP173). */
+export function p2wpkhAddress(pubkey: Uint8Array, network: Network = MAINNET): string {
+  return bech32.encode(network.bech32Hrp, [0, ...bech32.toWords(hash160(pubkey))])
+}
 
-/** Encode an account (pubkey + chain code) as a v1 payment code string. */
-export function encodePaymentCode(pubkey: Uint8Array, chainCode: Uint8Array): string {
+/** Encode a tweaked pubkey under the configured address type. */
+export function encodeAddress(
+  pubkey: Uint8Array,
+  type: AddressType,
+  network: Network = MAINNET,
+): string {
+  return type === 'p2wpkh' ? p2wpkhAddress(pubkey, network) : p2pkhAddress(pubkey, network)
+}
+
+export type PaymentCodeParts = { pubkey: Uint8Array; chainCode: Uint8Array; segwit: boolean }
+
+/**
+ * Encode an account (pubkey + chain code) as a v1 payment code string.
+ *
+ * `segwit` sets byte 79 — the Samourai feature flag — not the spec's feature
+ * bitfield at byte 1, which stays zero. A segwit-flagged code describes the
+ * SAME keys; only the advertised address encoding and the base58 string
+ * differ.
+ */
+export function encodePaymentCode(
+  pubkey: Uint8Array,
+  chainCode: Uint8Array,
+  segwit = false,
+): string {
   if (pubkey.length !== 33) throw new Error('payment code pubkey must be 33 bytes (compressed)')
   if (chainCode.length !== 32) throw new Error('payment code chain code must be 32 bytes')
   const body = new Uint8Array(80)
@@ -72,7 +108,7 @@ export function encodePaymentCode(pubkey: Uint8Array, chainCode: Uint8Array): st
   body[1] = 0x00 // features bitfield: no bitmessage, no notification-over-chain flags set
   body.set(pubkey, 2) // bytes 2..34  : sign byte + 32-byte x
   body.set(chainCode, 35) // bytes 35..66 : chain code
-  // bytes 67..79 reserved, left zero
+  body[SEGWIT_FEATURE_BYTE] = segwit ? 1 : 0
   const payload = new Uint8Array(1 + 80)
   payload[0] = PAYMENT_CODE_PREFIX
   payload.set(body, 1)
@@ -86,19 +122,35 @@ export function decodePaymentCode(paymentCode: string): PaymentCodeParts {
   const body = payload.subarray(1)
   if (body.length !== 80) throw new Error('invalid payment code length')
   if (body[0] !== PAYMENT_CODE_VERSION) throw new Error('unsupported payment code version')
-  return { pubkey: body.slice(2, 35), chainCode: body.slice(35, 67) }
+  return {
+    pubkey: body.slice(2, 35),
+    chainCode: body.slice(35, 67),
+    segwit: body[SEGWIT_FEATURE_BYTE] === 1,
+  }
 }
+
+// Version bytes for the synthetic extended key below. This is an internal
+// detail of the CKDpub vehicle, NOT a network parameter: the synthetic xpub
+// never leaves this function, is never serialised, and CKDpub yields identical
+// child pubkeys whatever version is stamped on it. Threading a network in here
+// only created the chance to stamp a version @scure/bip32 then rejects, which
+// is what made every testnet derivation throw 'Version mismatch'.
+const VEHICLE_XPUB_VERSION = 0x0488b21e
 
 /**
  * Build a watch-only HD node from a payment code so we can CKDpub into its
  * account children (B_i / A_i). We reuse @scure/bip32's audited CKDpub by
  * synthesising the xpub the account pubkey+chaincode represent.
+ *
+ * Network-independent by construction: a payment code carries no network
+ * information, and the network only matters when encoding a final address
+ * (see p2pkhAddress).
  */
-export function nodeFromPaymentCode(paymentCode: string, network: Network = MAINNET): HDKey {
+export function nodeFromPaymentCode(paymentCode: string): HDKey {
   const { pubkey, chainCode } = decodePaymentCode(paymentCode)
   const data = new Uint8Array(78)
   const dv = new DataView(data.buffer)
-  dv.setUint32(0, network.xpubVersion)
+  dv.setUint32(0, VEHICLE_XPUB_VERSION)
   data[4] = 3 // depth of m/47'/coin'/account'
   // parent fingerprint (5..9) and child number (9..13) intentionally zero
   data.set(chainCode, 13)
@@ -120,26 +172,33 @@ function sharedSecretScalar(shared: InstanceType<typeof Point>): bigint {
 
 /**
  * RECEIVER side. Given our own account node and the SENDER's payment code,
- * derive the P2PKH address at which we will receive their i-th payment.
+ * derive the address at which we will receive their i-th payment.
  *
  *   S_i = b_i * A_0     (b_i = our child-i privkey, A_0 = sender child-0 pubkey)
  *   s_i = SHA256(S_i.x)
- *   addr = P2PKH(B_i + s_i*G)
+ *   addr = encode(B_i + s_i*G)
+ *
+ * `type` selects the encoding of the tweaked pubkey. It defaults to P2PKH —
+ * the BIP47 spec's address and what the official vectors pin — while 'p2wpkh'
+ * encodes the SAME tweaked pubkey as bech32, which is what a sender deriving
+ * with getPaymentAddress(..., 'p2wpkh') produces; both sides land on the same
+ * address only when both ask for the same type. See SEGWIT_FEATURE_BYTE.
  */
 export function receiveAddress(
   ourAccount: HDKey,
   senderPaymentCode: string,
   index: number,
   network: Network = MAINNET,
+  type: AddressType = 'p2pkh',
 ): string {
-  const senderNode = nodeFromPaymentCode(senderPaymentCode, network)
+  const senderNode = nodeFromPaymentCode(senderPaymentCode)
   const A0 = Point.fromHex(senderNode.deriveChild(0).publicKey!)
   const ourChild = ourAccount.deriveChild(index)
   const bI = BigInt('0x' + toHex(ourChild.privateKey!))
   const BI = Point.fromHex(ourChild.publicKey!)
   const s = sharedSecretScalar(A0.multiply(bI))
   const pub = BI.add(Point.BASE.multiply(s))
-  return p2pkhAddress(pub.toRawBytes(true), network)
+  return encodeAddress(pub.toRawBytes(true), type, network)
 }
 
 /**
@@ -152,7 +211,7 @@ export function receivePrivateKey(
   index: number,
   network: Network = MAINNET,
 ): string {
-  const senderNode = nodeFromPaymentCode(senderPaymentCode, network)
+  const senderNode = nodeFromPaymentCode(senderPaymentCode)
   const A0 = Point.fromHex(senderNode.deriveChild(0).publicKey!)
   const ourChild = ourAccount.deriveChild(index)
   const bI = BigInt('0x' + toHex(ourChild.privateKey!))
@@ -164,22 +223,24 @@ export function receivePrivateKey(
 
 /**
  * SENDER side. Given our own account node and the RECEIVER's payment code,
- * derive the P2PKH address to pay for our i-th payment to them. This must equal
- * the receiver's `receiveAddress(...i)` — that equality is the entire mechanism.
+ * derive the address to pay for our i-th payment to them. This must equal
+ * the receiver's `receiveAddress(...i)` under the SAME address type — that
+ * equality is the entire mechanism.
  *
  *   S_i = a_0 * B_i     (a_0 = our child-0 privkey, B_i = receiver child-i pubkey)
- *   addr = P2PKH(B_i + SHA256(S_i.x)*G)
+ *   addr = encode(B_i + SHA256(S_i.x)*G)
  */
 export function sendAddress(
   ourAccount: HDKey,
   receiverPaymentCode: string,
   index: number,
   network: Network = MAINNET,
+  type: AddressType = 'p2pkh',
 ): string {
-  const receiverNode = nodeFromPaymentCode(receiverPaymentCode, network)
+  const receiverNode = nodeFromPaymentCode(receiverPaymentCode)
   const a0 = BigInt('0x' + toHex(ourAccount.deriveChild(0).privateKey!))
   const BI = Point.fromHex(receiverNode.deriveChild(index).publicKey!)
   const s = sharedSecretScalar(BI.multiply(a0))
   const pub = BI.add(Point.BASE.multiply(s))
-  return p2pkhAddress(pub.toRawBytes(true), network)
+  return encodeAddress(pub.toRawBytes(true), type, network)
 }

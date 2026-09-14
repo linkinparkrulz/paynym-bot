@@ -1,32 +1,22 @@
-// Live wiring example against a real Soroban node. This is illustrative, not a
-// daemon: it runs one receiver poll loop and one sender registration in the same
-// process so you can watch a notification-less registration happen over a real
-// node.
+// One-shot live demo against a real Soroban node: a customer registers with an
+// always-online merchant, with no notification transaction, and both sides
+// agree on the address to pay.
 //
 // Usage:
-//   node --experimental-strip-types example.ts --soroban http://<node>.onion/rpc
+//   node --experimental-strip-types example.ts --soroban http://127.0.0.1:4242/rpc
 //
-// Tor: Node's global fetch does not speak SOCKS. To reach a .onion node, pass a
-// transport built on undici + socks-proxy-agent instead of SorobanRPC.forUrl,
-// e.g.:
-//
-//   import { ProxyAgent } from 'undici'
-//   const dispatcher = new ProxyAgent('socks5://127.0.0.1:9050') // needs a SOCKS-capable agent
-//   const transport = async (payload) => (await fetch(url, { dispatcher, method:'POST', ... })).json()
-//   const rpc = new SorobanRPC(transport)
-//
-// For a clearnet test node you can use SorobanRPC.forUrl(url) directly.
+// In a real deployment Soroban sits beside the bot on the Dojo host, so this
+// talks to loopback and needs no SOCKS client. For the daemon proper, use the
+// CLI instead: `paynym-bot init` then `paynym-bot serve`.
 
 import { parseArgs } from 'node:util'
 import { randomBytes } from 'node:crypto'
 import { PaynymIdentity } from './src/identity.ts'
-import { SorobanRPC, BoxKeypair } from './src/soroban.ts'
+import { SorobanRPC } from './src/soroban.ts'
 import { Registrar, Registry, registerWithReceiver } from './src/register.ts'
 import { watchWindow } from './src/watcher.ts'
 
-const { values } = parseArgs({
-  options: { soroban: { type: 'string', short: 's' } },
-})
+const { values } = parseArgs({ options: { soroban: { type: 'string', short: 's' } } })
 const url = values.soroban
 if (!url) {
   console.error('pass --soroban http://<node>/rpc')
@@ -35,25 +25,25 @@ if (!url) {
 
 const rpc = SorobanRPC.forUrl(url)
 
-// Fresh identities for the demo. In production the receiver's seed is fixed and
-// backed up alongside its registry.
-const receiver = PaynymIdentity.fromSeed(randomBytes(32))
-const sender = PaynymIdentity.fromSeed(randomBytes(32))
+// Fresh identities for the demo. In production the merchant's seed is fixed and
+// backed up alongside its state file.
+const merchant = PaynymIdentity.fromSeed(randomBytes(64))
+const customer = PaynymIdentity.fromSeed(randomBytes(64))
 
-const registrar = new Registrar(receiver, BoxKeypair.generate(), new Registry())
+const registrar = new Registrar(merchant, new Registry())
 
-console.log('receiver payment code:', receiver.paymentCode())
-console.log('publishing rendezvous...')
-await registrar.publishRendezvous(rpc)
+console.log('merchant payment code:', merchant.paymentCode())
+console.log('inbox directory:      ', registrar.inbox())
 
-console.log('sender registering (no notification tx)...')
-await registerWithReceiver(rpc, sender, receiver.paymentCode())
+// The customer needs nothing but the payment code from the merchant's page.
+console.log('\ncustomer registering (no notification tx)...')
+await registerWithReceiver(rpc, customer, merchant.paymentCode())
 
-console.log('receiver polling inbox...')
+console.log('merchant draining inbox...')
 const added = await registrar.poll(rpc)
-console.log('newly registered senders:', added)
+console.log('newly registered customers:', added.length)
 
-for (const w of watchWindow(receiver, registrar.registry)) {
-  const match = sender.sendAddress(receiver.paymentCode(), w.index) === w.address
-  console.log(`  watch[${w.index}] ${w.address}  sender-agrees=${match}`)
+for (const w of watchWindow(merchant, registrar.registry)) {
+  const agrees = customer.sendAddress(merchant.paymentCode(), w.index) === w.address
+  console.log(`  watch[${w.index}] ${w.address}  customer-agrees=${agrees}`)
 }

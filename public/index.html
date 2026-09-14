@@ -1,0 +1,242 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PayNym</title>
+<style>
+  :root {
+    --bg: #0f1113; --ink: #e9edf1; --muted: #8b959f; --accent: #7cc4a4;
+    --warn: #d9a441; --bad: #d97a6c;
+    color-scheme: dark;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; background: var(--bg); color: var(--ink);
+    font: 15px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    display: grid; place-items: center; padding: 24px;
+  }
+  main { width: 100%; max-width: 480px; text-align: center; }
+  .stage { display: flex; flex-direction: column; align-items: center; gap: 18px; }
+
+  /* The QR is the page. Big, centred, with the centre overlay. */
+  .qrwrap {
+    position: relative; width: min(78vw, 340px); height: min(78vw, 340px);
+    background: #fff; border-radius: 16px; padding: 12px;
+  }
+  .qrwrap svg { width: 100%; height: 100%; display: block; }
+  .qrwrap img {
+    position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%);
+    /* The overlay covers ~22% of the symbol; EC 'H' (30% recovery) keeps it scannable. */
+    width: 26%; height: 26%; border-radius: 50%;
+    background: #fff; border: 3px solid #fff;
+    object-fit: cover; pointer-events: none;
+  }
+  .qrwrap.hidden-qr svg, .qrwrap.hidden-qr img { visibility: hidden; }
+
+  h1 { font-size: 20px; font-weight: 600; margin: 0; }
+  p.sub { color: var(--muted); margin: 0; }
+  .badge {
+    display: inline-block; font-size: 11px; letter-spacing: .08em; text-transform: uppercase;
+    padding: 3px 10px; border-radius: 999px; border: 1px solid #262b31; color: var(--muted);
+  }
+  .badge.testnet { color: var(--warn); border-color: var(--warn); }
+
+  .amount {
+    display: none; gap: 10px; align-items: center; justify-content: center; flex-wrap: wrap;
+  }
+  .amount.visible { display: flex; }
+  .amount input {
+    font: inherit; font-size: 18px; width: 11ch; text-align: center;
+    background: #0b0d0f; color: var(--ink); border: 1px solid #262b31;
+    border-radius: 8px; padding: 9px 10px;
+  }
+  .amount .unit { color: var(--muted); font-size: 14px; }
+  .address-line {
+    display: none; font: 12px/1.4 ui-monospace, Menlo, Consolas, monospace;
+    color: var(--muted); word-break: break-all; user-select: all; max-width: 100%;
+  }
+  .address-line.visible { display: block; }
+
+  /* Thank-you splash */
+  #splash {
+    position: fixed; inset: 0; background: var(--bg); display: none;
+    place-items: center; z-index: 10;
+  }
+  #splash.visible { display: grid; }
+  #splash .inner { text-align: center; animation: pop .45s ease-out; }
+  #splash h2 { font-size: 42px; margin: 0 0 8px; color: var(--accent); }
+  #splash p { color: var(--muted); margin: 0; }
+  @keyframes pop {
+    0% { transform: scale(.6); opacity: 0; }
+    60% { transform: scale(1.06); opacity: 1; }
+    100% { transform: scale(1); opacity: 1; }
+  }
+
+  .err { color: var(--bad); min-height: 1.4em; }
+  footer { margin-top: 26px; color: var(--muted); font-size: 12px; }
+  [hidden] { display: none !important; }
+</style>
+
+<main>
+  <span class="badge" id="network">…</span>
+
+  <div class="stage">
+    <!-- STATE 1: auth challenge QR, logo in the middle -->
+    <div class="qrwrap" id="qr-auth"><div id="auth-qr"></div><img id="logo-auth" src="/logo.png" alt=""></div>
+    <h1 id="heading">Scan to pay</h1>
+    <p class="sub" id="subline">Scan with your BIP47 wallet to begin.</p>
+
+    <!-- STATE 2: address QR, paynym avatar in the middle, amount box -->
+    <div class="qrwrap" id="qr-pay" hidden><div id="pay-qr"></div><img id="avatar" alt=""></div>
+    <div class="amount" id="amount">
+      <input id="btc" type="text" inputmode="decimal" placeholder="0.00" autocomplete="off">
+      <span class="unit">BTC</span>
+    </div>
+    <span class="address-line" id="address"></span>
+
+    <p class="err" id="error"></p>
+  </div>
+
+  <footer>No notification transaction. One payment, not two.</footer>
+</main>
+
+<div id="splash">
+  <div class="inner">
+    <h2>Thank you</h2>
+    <p>Payment seen. Returning to start…</p>
+  </div>
+</div>
+
+<script src="/js/qrcode.js"></script>
+<script>
+  const $ = (id) => document.getElementById(id);
+  const AVATAR = 'ht' + 'tps://paynym.rs' + '/PAYMENTCODE/avatar';
+
+  function qrSVG(container, text, px, ec, centerImg) {
+    const qr = qrcode(0, ec || 'H'); // 'H': the centre avatar overlay needs the recovery room
+    qr.addData(text);
+    qr.make();
+    const n = qr.getModuleCount(), margin = 2, total = n + margin * 2, cell = px / total;
+    let rects = '';
+    for (let row = 0; row < n; row++) for (let col = 0; col < n; col++) {
+      if (qr.isDark(row, col)) {
+        rects += '<rect x="' + ((col + margin) * cell).toFixed(2) + '" y="' +
+          ((row + margin) * cell).toFixed(2) + '" width="' + cell.toFixed(2) +
+          '" height="' + cell.toFixed(2) + '" fill="#0a0a0a"/>';
+      }
+    }
+    const NS = 'ht' + 'tp://www.w3.org/2000/svg';
+    container.innerHTML = '<svg xmlns="' + NS + '" viewBox="0 0 ' + px + ' ' + px +
+      '" shape-rendering="crispEdges">' + rects + '</svg>';
+  }
+
+  let pollTimer = null, paidTimer = null, session = null, address = null, shopCode = null;
+
+  function reset(reason) {
+    if (pollTimer) clearTimeout(pollTimer);
+    if (paidTimer) clearInterval(paidTimer);
+    pollTimer = paidTimer = session = address = null;
+    $('qr-pay').hidden = true;
+    $('amount').classList.remove('visible');
+    $('address').classList.remove('visible');
+    $('qr-auth').hidden = false;
+    $('heading').textContent = 'Scan to pay';
+    $('subline').textContent = reason || 'Scan with your BIP47 wallet to begin.';
+    $('splash').classList.remove('visible');
+  }
+
+  // --- state 1: fetch status, mint a challenge, show its QR --------------------
+  async function startAuth() {
+    try {
+      const s = await (await fetch('/api/status', { cache: 'no-store' })).json();
+      const badge = $('network');
+      badge.textContent = s.network;
+      if (s.network === 'testnet') badge.classList.add('testnet');
+      if (s.label) { $('heading').textContent = 'Pay ' + s.label; document.title = 'Pay ' + s.label; }
+      // The shop's own avatar, not the customer's: the pay QR is the shop's
+      // address, so the pepe in the middle is the shop's too.
+      shopCode = s.paymentCode
+
+      if (!s.auth47) {
+        $('subline').textContent = 'Scan-to-pay is unavailable here — copy the payment code instead.';
+        return;
+      }
+      const r = await fetch('/api/auth47/challenge', { method: 'POST' });
+      if (r.status === 429 || r.status === 503) {
+        $('subline').textContent = 'Busy right now — reload in a moment.';
+        return;
+      }
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const c = await r.json();
+      qrSVG($('auth-qr'), c.uri, 320, 'H');
+      poll(c.nonce, c.expires);
+    } catch (e) {
+      $('error').textContent = 'Could not start: ' + e.message;
+    }
+  }
+
+  function poll(nonce, expires) {
+    if (Date.now() > expires) { reset('Challenge expired — scan again.'); return; }
+    pollTimer = setTimeout(async () => {
+      try {
+        const r = await fetch('/api/auth47/poll?nonce=' + encodeURIComponent(nonce), { cache: 'no-store' });
+        if (r.status === 202) { poll(nonce, expires); return; }
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        const p = await r.json();
+        if (p.status === 'authenticated') showAddress(p.sessionId);
+        else poll(nonce, expires);
+      } catch {
+        reset('Lost the connection — scan again.');
+      }
+    }, 2500);
+  }
+
+  // --- state 2: show the address QR with the customer's paynym avatar -----------
+  async function showAddress(sessionId) {
+    if (pollTimer) clearTimeout(pollTimer);
+    const r = await fetch('/api/session/' + encodeURIComponent(sessionId), { cache: 'no-store' });
+    if (!r.ok) { reset('Session was refused — scan again.'); return; }
+    session = await r.json();
+    address = session.address;
+    $('qr-auth').hidden = true;
+    $('qr-pay').hidden = false;
+    $('heading').textContent = 'Pay this address';
+    $('subline').textContent = 'Scan with any wallet, or set an amount first.';
+    $('avatar').src = AVATAR.replace('PAYMENTCODE', encodeURIComponent(shopCode ?? session.paymentCode));
+    $('address').textContent = address;
+    $('address').classList.add('visible');
+    $('amount').classList.add('visible');
+    redrawPayQR();
+    watchPaid(sessionId);
+  }
+
+  function redrawPayQR() {
+    if (!address) return;
+    const v = parseFloat($('btc').value);
+    const uri = Number.isFinite(v) && v > 0
+      ? 'bitcoin:' + address + '?amount=' + v
+      : 'bitcoin:' + address;
+    qrSVG($('pay-qr'), uri, 320, 'H');
+  }
+  $('btc').addEventListener('input', () => {
+    // One redraw per keystroke; the QR is local and cheap.
+    redrawPayQR();
+  });
+
+  // --- state 3: watch for the payment, splash, return to start ------------------
+  function watchPaid(sessionId) {
+    paidTimer = setInterval(async () => {
+      try {
+        const r = await fetch('/api/session-paid?id=' + encodeURIComponent(sessionId), { cache: 'no-store' });
+        if (!r.ok) return;
+        const p = await r.json();
+        if (p.paid) {
+          $('splash').classList.add('visible');
+          setTimeout(() => reset(), 4000);
+        }
+      } catch { /* transient */ }
+    }, 4000);
+  }
+
+  startAuth();
+</script>
