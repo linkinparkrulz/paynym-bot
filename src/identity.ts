@@ -10,13 +10,14 @@ import { secp256k1 } from '@noble/curves/secp256k1'
 import { sha256 } from '@noble/hashes/sha256'
 import {
   MAINNET,
+  decodePaymentCode,
   encodePaymentCode,
   p2pkhAddress,
   receiveAddress,
   receivePrivateKey,
   sendAddress,
 } from './bip47.ts'
-import type { Network } from './bip47.ts'
+import type { AddressType, Network } from './bip47.ts'
 
 function toHex(u8: Uint8Array): string {
   return Buffer.from(u8).toString('hex')
@@ -30,9 +31,25 @@ function toHex(u8: Uint8Array): string {
  */
 const ADDRESS_CACHE_MAX = 200_000
 
+export type IdentityOptions = {
+  /**
+   * Address encoding this identity derives and advertises.
+   *
+   * 'p2wpkh' sets the payment code's Samourai segwit feature flag — byte 79 —
+   * so segwit-capable wallets (Samourai/Ashigaru, @dojo-tools/bip47) derive
+   * bech32 payment addresses for us, and every receive/send derivation here
+   * matches them. 'p2pkh' is the BIP47 spec address. The KEYS are identical
+   * either way; only the encoding and the advertised flag differ — which is
+   * why both codes describe the same wallet, and why every sender must be
+   * told which one to use.
+   */
+  addressType?: AddressType
+}
+
 export class PaynymIdentity {
   readonly network: Network
   readonly account: HDKey
+  readonly addressType: AddressType
   /**
    * Memo of derived receive addresses, keyed by payment code and index.
    *
@@ -46,21 +63,31 @@ export class PaynymIdentity {
    */
   private readonly addressCache = new Map<string, string>()
 
-  private constructor(account: HDKey, network: Network) {
+  private constructor(account: HDKey, network: Network, addressType: AddressType) {
     this.account = account
     this.network = network
+    this.addressType = addressType
   }
 
   /** Build an identity from a raw BIP32 seed. */
-  static fromSeed(seed: Uint8Array, network: Network = MAINNET, identity = 0): PaynymIdentity {
+  static fromSeed(
+    seed: Uint8Array,
+    network: Network = MAINNET,
+    identity = 0,
+    opts: IdentityOptions = {},
+  ): PaynymIdentity {
     const master = HDKey.fromMasterSeed(seed)
     const account = master.derive(`m/47'/${network.coinType}'/${identity}'`)
-    return new PaynymIdentity(account, network)
+    return new PaynymIdentity(account, network, opts.addressType ?? 'p2wpkh')
   }
 
   /** Our payment code (the "PM8T..." string) to hand to senders. */
   paymentCode(): string {
-    return encodePaymentCode(this.account.publicKey!, this.account.chainCode!)
+    return encodePaymentCode(
+      this.account.publicKey!,
+      this.account.chainCode!,
+      this.addressType === 'p2wpkh',
+    )
   }
 
   /**
@@ -95,12 +122,22 @@ export class PaynymIdentity {
    * Receiver: address to receive sender's `index`-th payment. Memoised; see
    * `addressCache`. Derivation is deterministic, so a hit is indistinguishable
    * from a fresh derivation.
+   *
+   * The sender's own segwit flag does not select the encoding here: senders
+   * pay the encoding OUR code advertises, so the watch window must match what
+   * we advertise or payments would land on addresses we never look at.
    */
   receiveAddress(senderPaymentCode: string, index: number): string {
     const key = `${senderPaymentCode}:${index}`
     const hit = this.addressCache.get(key)
     if (hit !== undefined) return hit
-    const address = receiveAddress(this.account, senderPaymentCode, index, this.network)
+    const address = receiveAddress(
+      this.account,
+      senderPaymentCode,
+      index,
+      this.network,
+      this.addressType,
+    )
     // Bounded, oldest-first: Map iterates in insertion order, and the oldest
     // key is the one furthest behind the moving watch window.
     if (this.addressCache.size >= ADDRESS_CACHE_MAX) {
@@ -118,7 +155,11 @@ export class PaynymIdentity {
 
   /** Sender: address to pay receiver's `index`-th payment. */
   sendAddress(receiverPaymentCode: string, index: number): string {
-    return sendAddress(this.account, receiverPaymentCode, index, this.network)
+    // The mirror of the rule above, seen from the sending side: pay the
+    // encoding the RECEIVER's code advertises, or they will not be watching
+    // the address we computed.
+    const type = decodePaymentCode(receiverPaymentCode).segwit ? 'p2wpkh' : 'p2pkh'
+    return sendAddress(this.account, receiverPaymentCode, index, this.network, type)
   }
 }
 

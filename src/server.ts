@@ -109,6 +109,14 @@ export type StorefrontOptions = {
    * served at all: this control has no safe default.
    */
   onionHost?: string
+  /**
+   * Funded-address oracle, for the paid-status endpoint the page polls while
+   * the customer waits. The daemon's own scan runs on a timer; this lets the
+   * page see a mempool arrival within one poll rather than one scan interval.
+   * Absent in storefront-only mode, where /paid answers from the registry
+   * alone (slower, but still correct).
+   */
+  isUsed?: (address: string) => Promise<boolean>
 }
 
 function json(res: ServerResponse, status: number, body: unknown): void {
@@ -165,6 +173,7 @@ function publicStatus(opts: StorefrontOptions, auth47Available: boolean) {
 export function createStorefront(opts: StorefrontOptions): Server {
   const index = readFileSync(join(PUBLIC_DIR, 'index.html'))
   const qrScript = readFileSync(join(PUBLIC_DIR, 'js', 'qrcode.js'))
+  const logo = readFileSync(join(PUBLIC_DIR, 'logo.png'))
   const sessions = new Auth47Sessions()
   // The host the operator published this storefront as, if they configured
   // one. Everything auth47 does is bound to it; see StorefrontOptions.
@@ -230,8 +239,10 @@ export function createStorefront(opts: StorefrontOptions): Server {
       res.writeHead(200, {
         'content-type': 'text/html; charset=utf-8',
         // No external anything: the page must work with no clearnet access.
+        // img-src pays a one-exception visit to paynym.rs for the customer's
+        // avatar — a passive, optional decoration on an already-public code.
         'content-security-policy':
-          "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline' 'self'; connect-src 'self'",
+          "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline' 'self'; img-src 'self' paynym.rs; connect-src 'self'",
         'referrer-policy': 'no-referrer',
         'x-content-type-options': 'nosniff',
       })
@@ -248,6 +259,18 @@ export function createStorefront(opts: StorefrontOptions): Server {
         'x-content-type-options': 'nosniff',
       })
       res.end(req.method === 'HEAD' ? undefined : qrScript)
+      return
+    }
+
+    // The shop logo the auth QR wears in its centre. Public and cacheable —
+    // it is the same file for every visitor.
+    if (url.pathname === '/logo.png') {
+      res.writeHead(200, {
+        'content-type': 'image/png',
+        'cache-control': 'public, max-age=86400',
+        'x-content-type-options': 'nosniff',
+      })
+      res.end(req.method === 'HEAD' ? undefined : logo)
       return
     }
 
@@ -426,6 +449,41 @@ export function createStorefront(opts: StorefrontOptions): Server {
         address,
         network: opts.network,
       })
+      return
+    }
+
+    // --- paid: has the session's address been paid? ------------------------------
+    //
+    // The page polls this after showing the address, so a payment entering the
+    // mempool is noticed within seconds rather than within a scan interval. It
+    // answers for the session's OWN address only — an id is unguessable, and
+    // nothing about any other customer can be probed here.
+    if (url.pathname === '/api/session-paid') {
+      if (!opts.registry || !opts.persist) {
+        return json(res, 503, { error: 'sessions unavailable' })
+      }
+      const sessionId = url.searchParams.get('id')
+      if (!sessionId) return json(res, 400, { error: 'missing id' })
+      const session = sessions.session(sessionId)
+      if (!session) return json(res, 404, { error: 'no such session' })
+      const record = opts.registry.get(session.paymentCode)
+      if (!record) return json(res, 404, { error: 'not registered' })
+
+      const index = record.nextIndex
+      const address = opts.identity.receiveAddress(session.paymentCode, index)
+      let paid = false
+      if (opts.isUsed) {
+        try {
+          paid = await opts.isUsed(address)
+        } catch {
+          paid = false // a flaky indexer must not look like a refused payment
+        }
+      } else {
+        // No oracle (storefront-only mode): answer from the registry, which
+        // only advances when the daemon's scan credited the address.
+        paid = record.usedAhead?.includes(index) ?? false
+      }
+      json(res, 200, { paid })
       return
     }
 

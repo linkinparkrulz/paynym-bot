@@ -49,6 +49,14 @@ export type PersistedState = {
    * from a request's own Host header. See StorefrontOptions.onionHost.
    */
   onion?: string
+  /**
+   * What the paynym.rs directory knows about our code, from the init-time
+   * registration (see paynymrs.ts). Informational only — the avatar and
+   * nymName resolve from the code itself — but kept so `status` can say what
+   * the directory shows, and so re-registration can be skipped when the
+   * claim already took.
+   */
+  paynym?: { nymName?: string; nymId?: string; claimed: boolean; at: number }
   /** Customers who have registered with us. Required to derive receive keys. */
   senders: SenderRecord[]
 }
@@ -83,6 +91,10 @@ export function parseState(raw: string): PersistedState {
     createdAt: typeof s.createdAt === 'number' ? s.createdAt : 0,
     label: typeof s.label === 'string' ? s.label : undefined,
     onion: typeof s.onion === 'string' && s.onion.length > 0 ? s.onion : undefined,
+    paynym:
+      s.paynym !== null && typeof s.paynym === 'object' && typeof (s.paynym as { at?: unknown }).at === 'number'
+        ? (s.paynym as PersistedState['paynym'])
+        : undefined,
     senders: s.senders as SenderRecord[],
   }
 }

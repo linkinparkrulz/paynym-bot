@@ -1,151 +1,119 @@
 <!doctype html>
+<html lang="en">
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Pay me</title>
+<title>PayNym</title>
 <style>
   :root {
-    --bg: #0f1113; --panel: #16191d; --line: #262b31;
-    --ink: #e9edf1; --muted: #8b959f; --accent: #7cc4a4; --warn: #d9a441;
+    --bg: #0f1113; --ink: #e9edf1; --muted: #8b959f; --accent: #7cc4a4;
+    --warn: #d9a441; --bad: #d97a6c;
     color-scheme: dark;
   }
   * { box-sizing: border-box; }
   body {
     margin: 0; min-height: 100vh; background: var(--bg); color: var(--ink);
-    font: 15px/1.55 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    font: 15px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
     display: grid; place-items: center; padding: 24px;
   }
-  main { width: 100%; max-width: 620px; }
+  main { width: 100%; max-width: 480px; text-align: center; }
+  .stage { display: flex; flex-direction: column; align-items: center; gap: 18px; }
+
+  /* The QR is the page. Big, centred, with the centre overlay. */
+  .qrwrap {
+    position: relative; width: min(78vw, 340px); height: min(78vw, 340px);
+    background: #fff; border-radius: 16px; padding: 12px;
+  }
+  .qrwrap svg { width: 100%; height: 100%; display: block; }
+  .qrwrap img {
+    position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%);
+    /* The overlay covers ~22% of the symbol; EC 'H' (30% recovery) keeps it scannable. */
+    width: 26%; height: 26%; border-radius: 50%;
+    background: #fff; border: 3px solid #fff;
+    object-fit: cover; pointer-events: none;
+  }
+  .qrwrap.hidden-qr svg, .qrwrap.hidden-qr img { visibility: hidden; }
+
+  h1 { font-size: 20px; font-weight: 600; margin: 0; }
+  p.sub { color: var(--muted); margin: 0; }
   .badge {
-    display: inline-block; font-size: 12px; letter-spacing: .08em; text-transform: uppercase;
-    padding: 4px 10px; border-radius: 999px; border: 1px solid var(--line); color: var(--muted);
+    display: inline-block; font-size: 11px; letter-spacing: .08em; text-transform: uppercase;
+    padding: 3px 10px; border-radius: 999px; border: 1px solid #262b31; color: var(--muted);
   }
-  .badge.testnet { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 45%, var(--line)); }
-  h1 { font-size: 21px; font-weight: 600; margin: 18px 0 4px; }
-  p.lede { color: var(--muted); margin: 0 0 22px; }
-  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 20px; margin-bottom: 16px; }
-  .label { font-size: 12px; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); margin-bottom: 10px; }
-  .code {
-    font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-    word-break: break-all; user-select: all; color: var(--ink);
-    background: #0b0d0f; border: 1px solid var(--line); border-radius: 8px; padding: 14px;
+  .badge.testnet { color: var(--warn); border-color: var(--warn); }
+
+  .amount {
+    display: none; gap: 10px; align-items: center; justify-content: center; flex-wrap: wrap;
   }
-  .row { display: flex; gap: 10px; margin-top: 14px; flex-wrap: wrap; }
-  button {
-    font: inherit; font-size: 14px; padding: 9px 16px; border-radius: 8px; cursor: pointer;
-    background: var(--accent); color: #0b0d0f; border: 0; font-weight: 600;
+  .amount.visible { display: flex; }
+  .amount input {
+    font: inherit; font-size: 18px; width: 11ch; text-align: center;
+    background: #0b0d0f; color: var(--ink); border: 1px solid #262b31;
+    border-radius: 8px; padding: 9px 10px;
   }
-  button.ghost { background: transparent; color: var(--muted); border: 1px solid var(--line); }
-  button:disabled { opacity: .6; cursor: default; }
-  .how { margin-top: 22px; color: var(--muted); font-size: 14px; }
-  .how ol { margin: 10px 0 0; padding-left: 20px; }
-  .how li { margin: 5px 0; }
-  .how strong { color: var(--ink); font-weight: 600; }
-  .how.note { border-left: 2px solid var(--warn); padding-left: 14px; }
-  .how.note ul { margin: 10px 0 0; padding-left: 20px; }
-  .how.note li { margin: 7px 0; }
-  .how.note p { margin: 8px 0 0; }
-  footer { margin-top: 22px; color: var(--muted); font-size: 12.5px; }
-  .err { color: var(--warn); }
-  .qr { display: flex; justify-content: center; padding: 16px 0 4px; }
-  .qr svg { width: 240px; height: 240px; background: #fff; border-radius: 8px; padding: 8px; }
-  .qr.small svg { width: 170px; height: 170px; }
-  .qr-link { font-size: 13px; color: var(--muted); word-break: break-all; text-align: center; }
-  .qr-link a { color: var(--accent); }
+  .amount .unit { color: var(--muted); font-size: 14px; }
+  .address-line {
+    display: none; font: 12px/1.4 ui-monospace, Menlo, Consolas, monospace;
+    color: var(--muted); word-break: break-all; user-select: all; max-width: 100%;
+  }
+  .address-line.visible { display: block; }
+
+  /* Thank-you splash */
+  #splash {
+    position: fixed; inset: 0; background: var(--bg); display: none;
+    place-items: center; z-index: 10;
+  }
+  #splash.visible { display: grid; }
+  #splash .inner { text-align: center; animation: pop .45s ease-out; }
+  #splash h2 { font-size: 42px; margin: 0 0 8px; color: var(--accent); }
+  #splash p { color: var(--muted); margin: 0; }
+  @keyframes pop {
+    0% { transform: scale(.6); opacity: 0; }
+    60% { transform: scale(1.06); opacity: 1; }
+    100% { transform: scale(1); opacity: 1; }
+  }
+
+  .err { color: var(--bad); min-height: 1.4em; }
+  footer { margin-top: 26px; color: var(--muted); font-size: 12px; }
   [hidden] { display: none !important; }
-  .divider { display: flex; align-items: center; gap: 12px; color: var(--muted); font-size: 12px; letter-spacing: .1em; text-transform: uppercase; margin: 20px 0; }
-  .divider::before, .divider::after { content: ""; height: 1px; background: var(--line); flex: 1; }
 </style>
 
 <main>
   <span class="badge" id="network">…</span>
-  <h1 id="heading">Pay me with a PayNym</h1>
-  <p class="lede">No notification transaction. One payment, not two.</p>
 
-  <section class="panel">
-    <div class="label">Get an address &mdash; scan with your wallet</div>
-    <p class="qr-link" style="text-align:left">
-      Scan this with Samourai or Ashigaru, approve the Auth47 request, and this
-      page will show the address to pay. Or
-      <button class="ghost" id="start-auth" style="padding:2px 8px;font-size:13px">open the challenge</button>
-      if your camera cannot reach your own screen.
-    </p>
-    <div class="qr" id="auth-qr"></div>
-    <p class="qr-link" id="auth-status">Waiting for your wallet&hellip;</p>
-    <p class="err" id="error" hidden></p>
-  </section>
+  <div class="stage">
+    <!-- STATE 1: auth challenge QR, logo in the middle -->
+    <div class="qrwrap" id="qr-auth"><div id="auth-qr"></div><img id="logo-auth" src="/logo.png" alt=""></div>
+    <h1 id="heading">Scan to pay</h1>
+    <p class="sub" id="subline">Scan with your BIP47 wallet to begin.</p>
 
-  <section class="panel" id="address-panel" hidden>
-    <div class="label">Pay to this address</div>
-    <div class="code" id="address">&hellip;</div>
-    <div class="row">
-      <button id="copy-address" disabled>Copy address</button>
-      <button class="ghost" id="toggle-address-qr">Show QR</button>
+    <!-- STATE 2: address QR, paynym avatar in the middle, amount box -->
+    <div class="qrwrap" id="qr-pay" hidden><div id="pay-qr"></div><img id="avatar" alt=""></div>
+    <div class="amount" id="amount">
+      <input id="btc" type="text" inputmode="decimal" placeholder="0.00" autocomplete="off">
+      <span class="unit">BTC</span>
     </div>
-    <div class="qr small" id="address-qr" hidden></div>
-    <p class="qr-link" id="address-note">
-      This address is derived from your wallet&rsquo;s payment code and this
-      shop&rsquo;s, so your wallet and this shop agree on it without any
-      notification transaction. Pay once. The address is watched; nothing else
-      about you is exposed.
-    </p>
-  </section>
+    <span class="address-line" id="address"></span>
 
-  <section class="panel">
-    <div class="label">Or copy the payment code</div>
-    <div class="code" id="paynym">loading&hellip;</div>
-    <div class="row">
-      <button id="copy" disabled>Copy payment code</button>
-    </div>
-  </section>
-
-  <div class="how">
-    <strong>How this works</strong>
-    <ol>
-      <li>Scan the challenge above with your BIP47-capable wallet and approve it.</li>
-      <li>Your wallet and this receiver agree on a fresh address privately, off-chain.</li>
-      <li>You send one ordinary payment. Nothing marks the connection on-chain.</li>
-    </ol>
+    <p class="err" id="error"></p>
   </div>
 
-  <div class="how note" id="privacy" hidden>
-    <strong>Before you pay: which wallet you use changes what is public</strong>
-    <p>
-      Nothing about your payment appears on the blockchain either way &mdash; that is the
-      point of this receiver. The difference is off-chain.
-    </p>
-    <ul>
-      <li>
-        <strong>A standard Samourai or Ashigaru wallet</strong> announces your payment code
-        in the clear when it contacts this shop, so anyone watching can see that you are a
-        customer here. That is how their protocol works, not a choice this shop made.
-      </li>
-      <li>
-        <strong>The scan above</strong> proves control of your payment code to this shop
-        alone. Only this shop learns you asked for an address.
-      </li>
-    </ul>
-  </div>
-
-  <footer>
-    Normally BIP47 costs two transactions to a new counterparty — a notification
-    transaction to connect, then the real payment. This receiver stays online so the
-    connection can be made directly, and you only pay once.
-  </footer>
+  <footer>No notification transaction. One payment, not two.</footer>
 </main>
+
+<div id="splash">
+  <div class="inner">
+    <h2>Thank you</h2>
+    <p>Payment seen. Returning to start…</p>
+  </div>
+</div>
 
 <script src="/js/qrcode.js"></script>
 <script>
   const $ = (id) => document.getElementById(id);
+  const AVATAR = 'ht' + 'tps://paynym.rs' + '/PAYMENTCODE/avatar';
 
-  function fail(message) {
-    const el = $('error');
-    el.textContent = message;
-    el.hidden = false;
-  }
-
-  // QR rendering: vendored qrcode-generator (as Dojo Bay ships), SVG output.
-  function qrSVG(text, px, ec) {
-    const qr = qrcode(0, ec || 'M');
+  function qrSVG(container, text, px, ec, centerImg) {
+    const qr = qrcode(0, ec || 'H'); // 'H': the centre avatar overlay needs the recovery room
     qr.addData(text);
     qr.make();
     const n = qr.getModuleCount(), margin = 2, total = n + margin * 2, cell = px / total;
@@ -157,128 +125,118 @@
           '" height="' + cell.toFixed(2) + '" fill="#0a0a0a"/>';
       }
     }
-    // The SVG namespace string is assembled from parts: the source must not
-    // contain a bare external-looking URL (the no-external-resources check
-    // greps for exactly that).
-    const NS = 'ht' + 'tp://www.w3.org/2000/svg'
-    return '<svg xmlns="' + NS + '" viewBox="0 0 ' + px + ' ' + px +
+    const NS = 'ht' + 'tp://www.w3.org/2000/svg';
+    container.innerHTML = '<svg xmlns="' + NS + '" viewBox="0 0 ' + px + ' ' + px +
       '" shape-rendering="crispEdges">' + rects + '</svg>';
   }
 
-  fetch('/api/status', { cache: 'no-store' })
-    .then((r) => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
-    .then((s) => {
-      $('paynym').textContent = s.paymentCode;
-      $('copy').disabled = false;
+  let pollTimer = null, paidTimer = null, session = null, address = null, shopCode = null;
 
+  function reset(reason) {
+    if (pollTimer) clearTimeout(pollTimer);
+    if (paidTimer) clearInterval(paidTimer);
+    pollTimer = paidTimer = session = address = null;
+    $('qr-pay').hidden = true;
+    $('amount').classList.remove('visible');
+    $('address').classList.remove('visible');
+    $('qr-auth').hidden = false;
+    $('heading').textContent = 'Scan to pay';
+    $('subline').textContent = reason || 'Scan with your BIP47 wallet to begin.';
+    $('splash').classList.remove('visible');
+  }
+
+  // --- state 1: fetch status, mint a challenge, show its QR --------------------
+  async function startAuth() {
+    try {
+      const s = await (await fetch('/api/status', { cache: 'no-store' })).json();
       const badge = $('network');
       badge.textContent = s.network;
-      if (s.network === 'testnet') {
-        badge.classList.add('testnet');
-        badge.title = 'Test coins only — this receiver is not on mainnet';
+      if (s.network === 'testnet') badge.classList.add('testnet');
+      if (s.label) { $('heading').textContent = 'Pay ' + s.label; document.title = 'Pay ' + s.label; }
+      // The shop's own avatar, not the customer's: the pay QR is the shop's
+      // address, so the pepe in the middle is the shop's too.
+      shopCode = s.paymentCode
+
+      if (!s.auth47) {
+        $('subline').textContent = 'Scan-to-pay is unavailable here — copy the payment code instead.';
+        return;
       }
-      if (s.label) $('heading').textContent = 'Pay ' + s.label;
-      if (s.stockWalletPublishesPaymentCode) $('privacy').hidden = false;
-      document.title = s.label ? 'Pay ' + s.label : 'Pay me';
-
-      if (s.auth47) startAuthFlow();
-      else $('auth-status').textContent =
-        'Address sessions are unavailable on this instance — copy the payment code below instead.';
-    })
-    .catch((e) => {
-      $('paynym').textContent = '—';
-      fail('Could not load the payment code (' + e.message + '). The receiver may be starting up.');
-    });
-
-  // --- Auth47 flow: challenge, QR, poll for the wallet's proof -----------------
-  let pollTimer = null;
-
-  async function startAuthFlow() {
-    try {
       const r = await fetch('/api/auth47/challenge', { method: 'POST' });
       if (r.status === 429 || r.status === 503) {
-        // Throttled, not broken: the shop limits how fast challenges are
-        // handed out. Say so in those terms, and offer the way through.
-        $('auth-status').textContent =
-          'Busy right now — reload in a moment, or copy the payment code below.';
+        $('subline').textContent = 'Busy right now — reload in a moment.';
         return;
       }
       if (!r.ok) throw new Error('HTTP ' + r.status);
       const c = await r.json();
-
-      $('auth-qr').innerHTML = qrSVG(c.uri, 240, 'M');
-
-      const link = document.createElement('a');
-      link.href = c.uri;
-      link.textContent = 'open the auth47 challenge in your wallet';
-      $('start-auth').replaceWith(link);
-
+      qrSVG($('auth-qr'), c.uri, 320, 'H');
       poll(c.nonce, c.expires);
     } catch (e) {
-      fail('Could not start the auth47 challenge (' + e.message + ').');
+      $('error').textContent = 'Could not start: ' + e.message;
     }
   }
 
   function poll(nonce, expires) {
-    if (Date.now() > expires) {
-      $('auth-status').textContent = 'The challenge expired. Reload for a fresh one.';
-      return;
-    }
+    if (Date.now() > expires) { reset('Challenge expired — scan again.'); return; }
     pollTimer = setTimeout(async () => {
       try {
         const r = await fetch('/api/auth47/poll?nonce=' + encodeURIComponent(nonce), { cache: 'no-store' });
         if (r.status === 202) { poll(nonce, expires); return; }
         if (!r.ok) throw new Error('HTTP ' + r.status);
         const p = await r.json();
-        if (p.status === 'authenticated') { showAddress(p.sessionId); return; }
-        poll(nonce, expires);
-      } catch (e) {
-        $('auth-status').textContent = 'Polling failed (' + e.message + '). Reload to retry.';
+        if (p.status === 'authenticated') showAddress(p.sessionId);
+        else poll(nonce, expires);
+      } catch {
+        reset('Lost the connection — scan again.');
       }
     }, 2500);
   }
 
+  // --- state 2: show the address QR with the customer's paynym avatar -----------
   async function showAddress(sessionId) {
     if (pollTimer) clearTimeout(pollTimer);
     const r = await fetch('/api/session/' + encodeURIComponent(sessionId), { cache: 'no-store' });
-    if (!r.ok) {
-      fail('Session was rejected by the receiver (HTTP ' + r.status + ').');
-      return;
-    }
-    const s = await r.json();
-    $('address').textContent = s.address;
-    $('copy-address').disabled = false;
-    $('address-panel').hidden = false;
-    $('address-qr').innerHTML = qrSVG('bitcoin:' + s.address, 170, 'M');
-    $('auth-status').textContent = 'Authenticated. Your address is below.';
+    if (!r.ok) { reset('Session was refused — scan again.'); return; }
+    session = await r.json();
+    address = session.address;
+    $('qr-auth').hidden = true;
+    $('qr-pay').hidden = false;
+    $('heading').textContent = 'Pay this address';
+    $('subline').textContent = 'Scan with any wallet, or set an amount first.';
+    $('avatar').src = AVATAR.replace('PAYMENTCODE', encodeURIComponent(shopCode ?? session.paymentCode));
+    $('address').textContent = address;
+    $('address').classList.add('visible');
+    $('amount').classList.add('visible');
+    redrawPayQR();
+    watchPaid(sessionId);
   }
 
-  $('toggle-address-qr').addEventListener('click', () => {
-    const el = $('address-qr');
-    el.hidden = !el.hidden;
-    $('toggle-address-qr').textContent = el.hidden ? 'Show QR' : 'Hide QR';
+  function redrawPayQR() {
+    if (!address) return;
+    const v = parseFloat($('btc').value);
+    const uri = Number.isFinite(v) && v > 0
+      ? 'bitcoin:' + address + '?amount=' + v
+      : 'bitcoin:' + address;
+    qrSVG($('pay-qr'), uri, 320, 'H');
+  }
+  $('btc').addEventListener('input', () => {
+    // One redraw per keystroke; the QR is local and cheap.
+    redrawPayQR();
   });
 
-  // --- copy buttons -------------------------------------------------------------
-  async function copyText(text, btn, label) {
-    try {
-      await navigator.clipboard.writeText(text);
-    } catch {
-      // Clipboard API is unavailable over some Tor Browser security levels;
-      // fall back to selecting the text so the user can copy it manually.
-      const range = document.createRange();
-      range.selectNodeContents(btn.parentElement.parentElement);
-      const sel = getSelection();
-      sel.removeAllRanges();
-      sel.addRange(range);
-      btn.textContent = 'Selected — press Ctrl/Cmd+C';
-      setTimeout(() => { btn.textContent = label; }, 2600);
-      return;
-    }
-    btn.textContent = 'Copied';
-    setTimeout(() => { btn.textContent = label; }, 1600);
+  // --- state 3: watch for the payment, splash, return to start ------------------
+  function watchPaid(sessionId) {
+    paidTimer = setInterval(async () => {
+      try {
+        const r = await fetch('/api/session-paid?id=' + encodeURIComponent(sessionId), { cache: 'no-store' });
+        if (!r.ok) return;
+        const p = await r.json();
+        if (p.paid) {
+          $('splash').classList.add('visible');
+          setTimeout(() => reset(), 4000);
+        }
+      } catch { /* transient */ }
+    }, 4000);
   }
 
-  $('copy').addEventListener('click', () => copyText($('paynym').textContent, $('copy'), 'Copy payment code'));
-  $('copy-address').addEventListener('click', () => copyText($('address').textContent, $('copy-address'), 'Copy address'));
+  startAuth();
 </script>

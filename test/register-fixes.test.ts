@@ -243,8 +243,8 @@ await (async () => {
     const window = watchWindow(bob, registrar.registry)
     assert('testnet: watch window is non-empty', window.length > 0)
     assert(
-      'testnet: every watch address encodes as testnet',
-      window.every((w) => w.address[0] === 'm' || w.address[0] === 'n'),
+      'testnet: every watch address encodes as testnet bech32',
+      window.every((w) => w.address.startsWith('tb1q')),
     )
     assert(
       'testnet: customer agrees on every watch address',

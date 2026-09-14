@@ -42,6 +42,7 @@ import {
 import { assertIndexerAllowed, isOnion, loadConfig, proxyFor } from '../src/config.ts'
 import { createStorefront } from '../src/server.ts'
 import { notificationAddresses, verifyProof } from '../src/auth47.ts'
+import { registerWithPaynymRs, torSocksReachable } from '../src/paynymrs.ts'
 import {
   assertNetworkMatches,
   isNetworkName,
@@ -238,6 +239,35 @@ async function init(): Promise<void> {
     console.log('  so an imported wallet derives the same PayNym as in your wallet app.')
     console.log('  You must pass --passphrase on every command, or the PayNym differs.\n')
   }
+
+  // Publish the code to the PayNym directory and claim it: the nymName and
+  // avatar the storefront shows resolve through the directory, so a wallet
+  // that pays us can find us there. Mainnet only — the directory indexes
+  // mainnet identities. Best effort, with the remedy on failure.
+  if (network === 'mainnet') {
+    console.log('  registering with paynym.rs (via Tor when available)…')
+    try {
+      const paynym = await registerWithPaynymRs(seed, identity.paymentCode(), {
+        proxy: (await torSocksReachable(config)) ? config.torSocks : undefined,
+      })
+      saveState(config.statePath, {
+        ...loadState(config.statePath),
+        paynym: {
+          nymName: paynym.nymName,
+          nymId: paynym.nymId,
+          claimed: paynym.claimed,
+          at: paynym.at,
+        },
+      })
+      console.log(`  PayNym directory: ${paynym.nymName ?? '(unnamed)'}${paynym.claimed ? '  (claimed)' : '  (claim pending — re-run init to retry)'}\n`)
+    } catch (err) {
+      console.log(`  paynym.rs registration failed: ${(err as Error).message}`)
+      console.log('  The receiver works without it; re-run init to retry, or register')
+      console.log('  the payment code by hand at paynym.rs.\n')
+    }
+  } else {
+    console.log('  (testnet: the paynym.rs directory indexes mainnet only — skipped)\n')
+  }
 }
 
 function status(): void {
@@ -387,6 +417,9 @@ function start(): void {
       saveState(config.statePath, { ...state, senders: registry.toJSON() })
     },
     onionHost: config.onion ?? state.onion,
+    // The funded-address oracle, so the page's paid-poll sees a mempool
+    // arrival within seconds instead of a scan interval.
+    isUsed: electrumUsedChecker(electrum, network),
   })
 
   server.listen(config.httpPort, '127.0.0.1', () => {

@@ -129,7 +129,7 @@ const client = new ElectrumClient({ host: ONION, port: 50001, proxy, timeoutMs: 
 assert('server.version answers through Tor', Array.isArray(await client.serverVersion()))
 const before = requested.length
 assert('a history query answers through Tor',
-  (await client.isUsed('141fi7TY3h936vRUKh1qfUZr8rSBuYbVBK', { p2pkhVersion: 0x00, coinType: 0 })) === true)
+  (await client.isUsed('141fi7TY3h936vRUKh1qfUZr8rSBuYbVBK', { p2pkhVersion: 0x00, coinType: 0, bech32Hrp: 'bc' })) === true)
 assert('the second call reused the tunnel', requested.length === before)
 client.close()
 

@@ -114,7 +114,8 @@ const peer = PaynymIdentity.fromSeed(
   networkFor('testnet'),
 )
 const recv = onTestnet.receiveAddress(peer.paymentCode(), 0)
-assert('testnet receive address encodes testnet', recv[0] === 'm' || recv[0] === 'n')
+// Identities default to p2wpkh, so receive addresses are bech32 on testnet.
+assert('testnet receive address encodes testnet', recv.startsWith('tb1q'))
 assert(
   'testnet sender agrees on the address',
   peer.sendAddress(onTestnet.paymentCode(), 0) === recv,

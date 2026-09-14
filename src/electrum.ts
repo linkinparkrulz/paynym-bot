@@ -15,7 +15,7 @@
 import { connect } from 'node:net'
 import type { Socket } from 'node:net'
 import { sha256 } from '@noble/hashes/sha256'
-import { base58check as base58checkFactory } from '@scure/base'
+import { base58check as base58checkFactory, bech32 } from '@scure/base'
 import type { Network } from './bip47.ts'
 import type { UsedChecker } from './watcher.ts'
 import { socksConnect } from './socks.ts'
@@ -25,22 +25,40 @@ const base58check = base58checkFactory(sha256)
 
 /**
  * Electrum addresses scripts by the SHA256 of the scriptPubKey, byte-reversed
- * and hex-encoded. For P2PKH the script is OP_DUP OP_HASH160 <20> OP_EQUALVERIFY
- * OP_CHECKSIG = 76a914{hash160}88ac.
+ * and hex-encoded. P2PKH is OP_DUP OP_HASH160 <20> OP_EQUALVERIFY OP_CHECKSIG
+ * (76a914{hash160}88ac); P2WPKH is OP_0 <20> (0014{hash160}).
  */
 export function addressToScriptHash(address: string, network: Network): string {
-  const payload = base58check.decode(address)
-  if (payload.length !== 21) throw new Error(`not a P2PKH address: ${address}`)
-  if (payload[0] !== network.p2pkhVersion) {
-    throw new Error(`address ${address} is not on the configured network`)
+  let script: Uint8Array
+
+  // Bech32 (P2WPKH): HRP selects the network, witness v0 program is hash160.
+  if (address.startsWith('bc1') || address.startsWith('tb1')) {
+    const { prefix, words } = bech32.decode(address as `${string}1${string}`)
+    if (prefix !== network.bech32Hrp) {
+      throw new Error(`address ${address} is not on the configured network`)
+    }
+    if (words[0] !== 0) throw new Error(`not a P2WPKH address: ${address}`)
+    const program = bech32.fromWords(words.slice(1))
+    if (program.length !== 20) throw new Error(`not a P2WPKH address: ${address}`)
+    script = new Uint8Array(22)
+    script[0] = 0x00 // OP_0
+    script[1] = 0x14 // push 20
+    script.set(program, 2)
+  } else {
+    // Base58check (P2PKH).
+    const payload = base58check.decode(address)
+    if (payload.length !== 21) throw new Error(`not a P2PKH address: ${address}`)
+    if (payload[0] !== network.p2pkhVersion) {
+      throw new Error(`address ${address} is not on the configured network`)
+    }
+    script = new Uint8Array(25)
+    script[0] = 0x76 // OP_DUP
+    script[1] = 0xa9 // OP_HASH160
+    script[2] = 0x14 // push 20
+    script.set(payload.subarray(1), 3)
+    script[23] = 0x88 // OP_EQUALVERIFY
+    script[24] = 0xac // OP_CHECKSIG
   }
-  const script = new Uint8Array(25)
-  script[0] = 0x76 // OP_DUP
-  script[1] = 0xa9 // OP_HASH160
-  script[2] = 0x14 // push 20
-  script.set(payload.subarray(1), 3)
-  script[23] = 0x88 // OP_EQUALVERIFY
-  script[24] = 0xac // OP_CHECKSIG
   return Buffer.from(sha256(script)).reverse().toString('hex')
 }
 
